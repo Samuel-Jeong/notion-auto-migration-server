@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Notion Local Backup</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 980px; margin: 40px auto; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin-bottom: 20px; }
+    h2 { margin-top: 0; }
+    input, button, select { padding: 8px; border-radius: 8px; border: 1px solid #bbb; }
+    form { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; }
+  </style>
+</head>
+<body>
+  <h1>Notion Local Backup</h1>
+
+  <div class="card">
+    <h2>수동 덤프</h2>
+    <form method="post" action="/ui/dump">
+      <input type="text" name="page_id" placeholder="노션 루트 페이지 ID" style="flex:1" required />
+      <button type="submit">덤프 실행</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>수동 마이그레이션</h2>
+    <form method="post" action="/ui/migrate">
+      <select name="dump_name" required>
+        <option value="" disabled selected>덤프를 선택하세요</option>
+        {% for d in dumps %}
+          <option value="{{ d }}">{{ d }}</option>
+        {% endfor %}
+      </select>
+      <input type="text" name="target_page_id" placeholder="마이그 대상 노션 페이지 ID" style="flex:1" required />
+      <button type="submit">마이그 실행</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>덤프 목록</h2>
+    <table>
+      <thead>
+        <tr><th>폴더명</th><th>manifest</th><th>정적 경로</th></tr>
+      </thead>
+      <tbody>
+      {% for d in dumps %}
+        <tr>
+          <td>{{ d }}</td>
+          <td><a href="/api/dump/{{ d }}/download">manifest.json</a></td>
+          <td><a href="/files/{{ d }}/" target="_blank">/files/{{ d }}/</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <p>정적 파일 베이스 URL: <code>{{ static_base }}</code></p>
+  <p>API 문서: <a href="/docs">/docs</a></p>
+</body>
+</html>
