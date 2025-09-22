@@ -1,0 +1,10 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+.env
+node_modules/
+_dumps/
+_logs/
+deploy/config.local.yml

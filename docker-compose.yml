@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  notion-local-backup:
+    container_name: notion-local-backup
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: notion-local-backup:latest
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      TZ: "Asia/Seoul"
+      UVICORN_PORT: "8000"
+      UVICORN_HOST: "0.0.0.0"
+    volumes:
+      - ./_dumps:/app/_dumps
+      - ./_logs:/app/_logs              # ← 추가: 로그 볼륨
+      - ./deploy/config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 10s

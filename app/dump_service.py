@@ -1,13 +1,21 @@
-import os, re, json, pathlib, asyncio
+import os
+import re
+import json
+import pathlib
+import asyncio
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
+
 import httpx
 from fastapi.concurrency import run_in_threadpool
+
 from .notion_client import build_client, notion_retry
 from .config import Settings
 from .utils_id import normalize_notion_id
 
 ASSET_TYPES = {"image", "file", "pdf", "video", "audio"}
+ASSET_CONCURRENCY = 5
+ASSET_CHUNK = 128 * 1024
 
 def safe_slug(text: str, default: str = "page") -> str:
     text = (text or "").strip()
@@ -17,23 +25,28 @@ def safe_slug(text: str, default: str = "page") -> str:
 async def ensure_dir(path: str):
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
 
-async def download_asset(url: str, dest_path: str, timeout: int = 30):
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        pathlib.Path(os.path.dirname(dest_path)).mkdir(parents=True, exist_ok=True)
-        with open(dest_path, "wb") as f:
-            f.write(r.content)
+async def download_asset(url: str, dest_path: str, timeout: int):
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with client.stream("GET", url) as r:
+            r.raise_for_status()
+            pathlib.Path(os.path.dirname(dest_path)).mkdir(parents=True, exist_ok=True)
+            with open(dest_path, "wb") as f:
+                async for chunk in r.aiter_bytes(ASSET_CHUNK):
+                    if chunk:
+                        f.write(chunk)
 
-def _page_title_from_properties(properties: Dict[str, Any]) -> str:
-    for k, v in properties.items():
+def _page_title_from_properties(props: Dict[str, Any]) -> str:
+    for _, v in props.items():
         if v.get("type") == "title":
-            spans = v.get("title", [])
-            s = "".join([i.get("plain_text", "") for i in spans])
+            s = "".join(t.get("plain_text", "") for t in v.get("title", []))
             return s or "untitled"
     return "untitled"
 
 class NotionDumpService:
+    """
+    children.list 1패스로 스냅샷 + 매니페스트 구축.
+    manifest.nodes[*].files[] = {url, path, original, saved}
+    """
     def __init__(self, settings: Settings):
         self.settings = settings
         self.client = build_client(settings.NOTION_TOKEN, settings.NOTION_TIMEOUT)
@@ -43,111 +56,85 @@ class NotionDumpService:
         return self.client.pages.retrieve(page_id=page_id)
 
     @notion_retry()
-    def _get_block(self, block_id: str) -> Dict[str, Any]:
-        return self.client.blocks.retrieve(block_id=block_id)
-
-    @notion_retry()
     def _list_children(self, block_id: str, start_cursor: Optional[str] = None) -> Dict[str, Any]:
         return self.client.blocks.children.list(block_id=block_id, start_cursor=start_cursor, page_size=100)
 
-    async def dump_page_tree(self, root_page_id: str) -> str:
-        """root_page_id 이하 전체 트리를 로컬에 덤프하고 루트 폴더 경로를 반환"""
+    async def dump_page_tree(
+        self,
+        root_page_id: str,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
+        cancel_cb: Optional[Callable[[], bool]] = None,
+    ) -> str:
+        def check_cancel():
+            if cancel_cb and cancel_cb():
+                raise asyncio.CancelledError()
+
+        if progress_cb: progress_cb(1, "Normalizing page ID")
         root_page_id = normalize_notion_id(root_page_id)
+
+        if progress_cb: progress_cb(3, "Fetching root page")
         page = await run_in_threadpool(self._get_page, root_page_id)
         title = _page_title_from_properties(page.get("properties", {}))
+
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        root_dir = os.path.join(self.settings.DUMP_ROOT, f"{safe_slug(title)}_{stamp}")
+        dump_name = f"{safe_slug(title)}_{stamp}"
+        root_dir = os.path.join(self.settings.DUMP_ROOT, dump_name)
         await ensure_dir(root_dir)
+        if progress_cb: progress_cb(5, f"Preparing folder: {dump_name}")
 
-        # 전체 트리 DFS
-        manifest = {
-            "root_page_id": root_page_id,
-            "title": title,
-            "created_at": stamp,
-            "static_base_url": self.settings.STATIC_BASE_URL,
-            "nodes": []  # 각 노드(page/block) 메타
-        }
+        manifest = {"root_page_id": root_page_id, "title": title, "created_at": stamp,
+                    "static_base_url": self.settings.STATIC_BASE_URL, "nodes": []}
 
-        async def walk(block_id: str, rel_dir: str):
-            # 블록/페이지 메타
-            meta = await run_in_threadpool(self._get_block, block_id)
-            node = {"id": meta["id"], "type": meta["type"], "has_children": meta.get("has_children", False), "files": []}
-            # 페이지면 제목 갱신
-            if meta["type"] == "child_page":
-                node["title"] = meta.get("child_page", {}).get("title")
-            if meta["type"] == "child_database":
-                node["title"] = meta.get("child_database", {}).get("title")
+        async def walk_children(parent_id: str, rel_dir: str) -> List[Dict[str, Any]]:
+            snapshot_children: List[Dict[str, Any]] = []
+            cursor: Optional[str] = None
+            downloads: List[asyncio.Task] = []
 
-            # 블록이 에셋을 가진 경우 다운로드
-            t = meta["type"]
-            data = meta.get(t, {})
-            if t in ("image", "file", "pdf", "video", "audio"):
-                fobj = data.get("file") or data.get("external")
-                if fobj:
-                    url = fobj.get("url")
-                    if url:
-                        fname = f"{meta['id']}"
-                        ext = os.path.splitext(url.split("?")[0])[1] or ".bin"
-                        out_path = os.path.join(self.settings.DUMP_ROOT, rel_dir, f"{fname}{ext}")
-                        await download_asset(url, out_path, timeout=self.settings.NOTION_TIMEOUT)
-                        node["files"].append({
-                            "url": url,
-                            "path": os.path.relpath(out_path, self.settings.DUMP_ROOT).replace("\\", "/")
-                        })
+            while True:
+                check_cancel()
+                res = await run_in_threadpool(self._list_children, parent_id, cursor)
+                for b in res.get("results", []):
+                    t = b.get("type")
+                    snap = {"id": b.get("id"), "type": t, "has_children": b.get("has_children", False),
+                            t: b.get(t, {}) or {}, "children": []}
+                    man = {"id": b.get("id"), "type": t, "has_children": b.get("has_children", False), "files": []}
 
-            # children 순회
-            children: List[Dict[str, Any]] = []
-            if meta.get("has_children"):
-                cursor = None
-                while True:
-                    res = await run_in_threadpool(self._list_children, block_id, cursor)
-                    for c in res.get("results", []):
-                        children.append(c["id"])
-                    if not res.get("has_more"):
-                        break
-                    cursor = res.get("next_cursor")
+                    data = b.get(t, {}) or {}
+                    if t in ASSET_TYPES:
+                        fobj = data.get("file") or data.get("external")
+                        if fobj and fobj.get("url"):
+                            url = fobj["url"]
+                            pure = url.split("?")[0]
+                            original = os.path.basename(pure) or "file.bin"
+                            ext = os.path.splitext(pure)[1] or ".bin"
+                            saved = f"{b['id']}{ext}"
+                            out_path = os.path.join(self.settings.DUMP_ROOT, rel_dir, saved)
+                            await ensure_dir(os.path.dirname(out_path))
+                            downloads.append(asyncio.create_task(download_asset(url, out_path, self.settings.NOTION_TIMEOUT)))
+                            rel = os.path.relpath(out_path, self.settings.DUMP_ROOT).replace("\\", "/")
+                            man["files"].append({"url": url, "path": rel, "original": original, "saved": saved})
 
-            manifest["nodes"].append(node)
+                    if b.get("has_children"):
+                        snap["children"] = await walk_children(b["id"], rel_dir)
 
-            # 자식 디렉터리명
-            for cid in children:
-                await walk(cid, rel_dir)
+                    snapshot_children.append(snap)
+                    manifest["nodes"].append(man)
 
-        # 루트는 block API로 시작
-        await walk(root_page_id, os.path.basename(root_dir))
+                if not res.get("has_more"): break
+                cursor = res.get("next_cursor")
 
-        # 전체 블록 JSON 스냅샷도 저장 (복원용)
-        # 루트 페이지 전체 children 트리를 구조화하여 저장
-        tree_path = os.path.join(root_dir, "tree.json")
-        page_snapshot = await self._snapshot_tree(root_page_id)
-        with open(tree_path, "w", encoding="utf-8") as f:
-            json.dump(page_snapshot, f, ensure_ascii=False, indent=2)
+            if downloads:
+                if progress_cb: progress_cb(90, f"Downloading {len(downloads)} assets")
+                await asyncio.gather(*downloads)
+            return snapshot_children
 
-        # 매니페스트 저장
+        snapshot_root = {"id": root_page_id, "type": "root", "has_children": True,
+                         "children": await walk_children(root_page_id, os.path.basename(root_dir))}
+
+        with open(os.path.join(root_dir, "tree.json"), "w", encoding="utf-8") as f:
+            json.dump(snapshot_root, f, ensure_ascii=False, indent=2)
         with open(os.path.join(root_dir, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
 
+        if progress_cb: progress_cb(100, "Complete")
         return root_dir
-
-    async def _snapshot_tree(self, block_id: str) -> Dict[str, Any]:
-        """블록(페이지) 이하 children 전체를 JSON 트리로 직렬화(이미지/파일 URL 포함).
-        마이그레이션 시 이 구조를 이용해 블록을 재생성한다.
-        """
-        meta = await run_in_threadpool(self._get_block, block_id)
-        node = {k: meta[k] for k in ("id", "type", "has_children") if k in meta}
-        t = meta["type"]
-        node[t] = meta.get(t, {})
-        node["children"] = []
-
-        # children
-        if meta.get("has_children"):
-            cursor = None
-            while True:
-                res = await run_in_threadpool(self._list_children, block_id, cursor)
-                for c in res.get("results", []):
-                    sub = await self._snapshot_tree(c["id"])
-                    node["children"].append(sub)
-                if not res.get("has_more"):
-                    break
-                cursor = res.get("next_cursor")
-        return node

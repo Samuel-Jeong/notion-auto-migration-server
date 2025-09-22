@@ -25,6 +25,7 @@ Thumbs.db
 
 # Local dumps
 _dumps/
+_logs/
 
 # Env files
 .env

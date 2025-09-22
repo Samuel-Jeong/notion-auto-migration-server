@@ -1,140 +1,237 @@
-from typing import Dict, Any, List, Optional, Tuple
+import os
+import mimetypes
+import logging
+import asyncio
+from typing import Dict, Any, List, Optional, Callable
+
+import httpx
 from fastapi.concurrency import run_in_threadpool
+
 from .notion_client import build_client, notion_retry
 from .config import Settings
+from .utils_id import normalize_notion_id
 
-# Notion 제약: children.append 한 번에 최대 100개
 APPEND_LIMIT = 100
+ASSET_BLOCK_TYPES = ("image", "file", "pdf", "video", "audio")
+NOTION_VERSION = "2022-06-28"   # File upload endpoint supported version
+
+# Upload allowed capacity (default 20MB)
+DEFAULT_UPLOAD_MB = 20
+
+logger = logging.getLogger("app.migrate_service")
+
 
 class NotionMigrateService:
+    """
+    - Recursively create under target_page_id based on tree.json
+    - Files/images are uploaded to Notion storage from local dump files and attached
+    - Progress callback (progress_cb) support
+    """
     def __init__(self, settings: Settings):
         self.settings = settings
         self.client = build_client(settings.NOTION_TOKEN, settings.NOTION_TIMEOUT)
+
+        self.upload_max_bytes = int(os.environ.get("ASSET_UPLOAD_MAX_MB", DEFAULT_UPLOAD_MB)) * 1024 * 1024
+        self._upload_cache: Dict[str, str] = {}  # local_path -> upload_id
+        self._upload_lock = asyncio.Lock()
 
     @notion_retry()
     def _append_children(self, parent_block_id: str, children: List[Dict[str, Any]]) -> Dict[str, Any]:
         return self.client.blocks.children.append(block_id=parent_block_id, children=children)
 
     # -------------------------------
-    # 에셋(URL) 치환
+    # Notion File Uploads API
     # -------------------------------
-    def _rewrite_file_block(
-        self,
-        src_node: Dict[str, Any],
-        payload_block: Dict[str, Any],
-        asset_url_map: Dict[str, List[str]]
-    ) -> Dict[str, Any]:
-        """
-        덤프 시 기록한 manifest의 file path를 STATIC_BASE_URL로 노출하여 external 링크로 교체.
-        같은 노드에 여러 파일이 있을 수 있으므로 첫 번째를 사용(필요 시 확장).
-        """
-        t = payload_block["type"]
-        if t not in ("image", "file", "pdf", "video", "audio"):
-            return payload_block
-
-        node_id = src_node.get("id")
-        candidates = asset_url_map.get(node_id, [])
-        if not candidates:
-            # 매니페스트에 파일 기록이 없다면 기존 값 유지(원 URL 그대로)
-            return payload_block
-
-        # external로 강제 교체
-        data = payload_block.get(t, {})
-        data["external"] = {"url": candidates[0]}
-        data.pop("file", None)
-        payload_block[t] = data
-        return payload_block
-
-    # -------------------------------
-    # 페이로드 변환
-    # -------------------------------
-    def _node_to_block_payload(
-        self,
-        src_node: Dict[str, Any],
-        asset_url_map: Dict[str, List[str]]
-    ) -> Dict[str, Any]:
-        """
-        tree.json의 노드를 Notion children.append에 넣을 수 있는 1개 block payload로 변환.
-        기본적으로 원본 노드의 type 서브페이로드를 그대로 사용하되,
-        파일/이미지 계열은 external URL로 치환한다.
-        """
-        t = src_node["type"]
-        payload = {
-            "object": "block",
-            "type": t,
-            t: src_node.get(t, {}) or {}
+    async def _create_file_upload(self, file_name: str, content_type: str) -> Optional[Dict[str, Any]]:
+        headers = {
+            "Authorization": f"Bearer {self.settings.NOTION_TOKEN}",
+            "Notion-Version": NOTION_VERSION,
+            "Content-Type": "application/json",
         }
-        # 파일/이미지 블록 external URL 치환
-        payload = self._rewrite_file_block(src_node, payload, asset_url_map)
+        payload = {"file_name": file_name, "content_type": content_type}
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.NOTION_TIMEOUT) as client:
+                r = await client.post("https://api.notion.com/v1/file_uploads", headers=headers, json=payload)
+                r.raise_for_status()
+                return r.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error creating file upload for {file_name}: {e.response.status_code} - {e.response.text}")
+            return None
+        except httpx.TimeoutException:
+            logger.error(f"Timeout creating file upload for {file_name}")
+            return None
+        except Exception as e:
+            logger.exception(f"Unexpected error creating file upload for {file_name}: {e}")
+            return None
+
+    async def _send_file_upload(self, upload_id: str, local_path: str, content_type: str) -> bool:
+        """Upload file directly to Notion using the /file_uploads/{id}/send endpoint"""
+        file_name = os.path.basename(local_path)
+        upload_url = f"https://api.notion.com/v1/file_uploads/{upload_id}/send"
+        
+        headers = {
+            "Authorization": f"Bearer {self.settings.NOTION_TOKEN}",
+            "Notion-Version": NOTION_VERSION,
+        }
+        
+        try:
+            async with httpx.AsyncClient(timeout=max(10, self.settings.NOTION_TIMEOUT)) as client:
+                with open(local_path, "rb") as fp:
+                    files = {"file": (file_name, fp, content_type)}
+                    r = await client.post(upload_url, files=files, headers=headers)
+                    if r.status_code // 100 == 2:
+                        logger.info(f"Successfully uploaded {file_name} to Notion")
+                        return True
+                    logger.error(f"File upload failed for {file_name}: {r.status_code} - {r.text}")
+                    return False
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error uploading {file_name}: {e.response.status_code} - {e.response.text}")
+            return False
+        except httpx.TimeoutException:
+            logger.error(f"Timeout uploading {file_name}")
+            return False
+        except Exception as e:
+            logger.exception(f"Unexpected error uploading {file_name}: {e}")
+            return False
+
+    async def _upload_to_notion(self, local_path: str) -> Optional[str]:
+        async with self._upload_lock:
+            if local_path in self._upload_cache:
+                return self._upload_cache[local_path]
+
+        try:
+            size = os.path.getsize(local_path)
+        except OSError:
+            logger.error(f"Failed to get file size for {local_path}")
+            return None
+        if size > self.upload_max_bytes:
+            logger.warning(f"File {local_path} size {size} bytes exceeds limit {self.upload_max_bytes}")
+            return None
+
+        ctype = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
+        create = await self._create_file_upload(os.path.basename(local_path), ctype)
+        if not create:
+            logger.error(f"Failed to create file upload object for {local_path}")
+            return None
+
+        upload_id = create.get("id")
+        if not upload_id:
+            logger.error(f"Invalid upload response for {local_path}: missing upload ID")
+            return None
+
+        # Upload file directly to Notion using the new API flow
+        if not await self._send_file_upload(upload_id, local_path, ctype):
+            logger.error(f"Failed to upload file {local_path}")
+            return None
+
+        # File is ready to use immediately after upload - no completion step needed
+        async with self._upload_lock:
+            self._upload_cache[local_path] = upload_id
+        logger.info(f"Successfully uploaded and cached {os.path.basename(local_path)} with ID {upload_id}")
+        return upload_id
+
+    # -------------------------------
+    # Payload conversion
+    # -------------------------------
+    async def _node_to_block_payload(
+        self,
+        src_node: Dict[str, Any],
+        asset_map: Dict[str, List[Dict[str, Any]]],  # node_id -> [{"local_path","original","rel_path"}...]
+    ) -> Dict[str, Any]:
+        t = src_node["type"]
+        payload = {"object": "block", "type": t, t: src_node.get(t, {}) or {}}
+
+        if t in ASSET_BLOCK_TYPES:
+            sub = payload.get(t, {}) or {}
+            caption = sub.get("caption") if isinstance(sub, dict) else None
+
+            info = (asset_map.get(src_node.get("id") or "", []) or [{}])[0]
+            local_path = info.get("local_path")
+            original = info.get("original")
+
+            new_sub: Dict[str, Any]
+            upload_id = await self._upload_to_notion(local_path) if local_path else None
+            if upload_id:
+                new_sub = {"type": "file_upload", "file_upload": {"id": upload_id}}
+            else:
+                # Upload failed → preserve caption only (don't use external URLs)
+                new_sub = {}
+
+            if not caption and original:
+                caption = [{"type": "text", "text": {"content": original}}]
+            if caption:
+                new_sub["caption"] = caption
+
+            payload[t] = new_sub or {}  # Empty dict is allowed for append (though file blocks without content are meaningless)
+
         return payload
 
     # -------------------------------
-    # 재귀 생성의 핵심
+    # Recursive creation
     # -------------------------------
     async def _append_children_recursive(
         self,
         parent_id: str,
         src_children: List[Dict[str, Any]],
-        asset_url_map: Dict[str, List[str]]
+        asset_map: Dict[str, List[Dict[str, Any]]],
+        progress_cb: Optional[Callable[[int, str], None]],
+        counter: Dict[str, int],
+        total: int,
     ):
-        """
-        1) 자식 노드들을 100개 단위로 append
-        2) append 응답의 results 순서가 요청 순서와 동일하므로,
-           각 응답 결과 블록 ID와 src_children의 동일 인덱스를 매칭
-        3) 자식에게 또 children이 있으면 방금 생성된 해당 블록 ID를 parent로 재귀
-        """
         if not src_children:
             return
 
-        # 100개 단위로 청크
         for i in range(0, len(src_children), APPEND_LIMIT):
-            chunk = src_children[i:i+APPEND_LIMIT]
+            chunk = src_children[i:i + APPEND_LIMIT]
 
-            # 1) 요청 페이로드로 변환
             payload_chunk: List[Dict[str, Any]] = []
-            for node in chunk:
-                payload_chunk.append(self._node_to_block_payload(node, asset_url_map))
+            for n in chunk:
+                payload_chunk.append(await self._node_to_block_payload(n, asset_map))
 
-            # 2) append 호출
             try:
                 resp = await run_in_threadpool(self._append_children, parent_id, payload_chunk)
                 results: List[Dict[str, Any]] = resp.get("results", [])
-            except Exception as e:
-                # 청크 전체 실패 시, 단일 재시도(격리) 전략: 각 항목을 개별 append로 시도
-                # (큰 문서에서도 최대한 진행되도록 함)
+            except Exception:
                 results = []
-                for j, single_node in enumerate(chunk):
+                for n in chunk:
                     try:
-                        r = await run_in_threadpool(self._append_children, parent_id, [self._node_to_block_payload(single_node, asset_url_map)])
-                        if r.get("results"):
-                            results.append(r["results"][0])
-                        else:
-                            results.append({})
+                        single = await self._node_to_block_payload(n, asset_map)
+                        r = await run_in_threadpool(self._append_children, parent_id, [single])
+                        results.append((r.get("results") or [{}])[0])
                     except Exception:
-                        results.append({})  # 실패 항목은 빈 dict로 채움
+                        results.append({})
 
-            # 3) 응답과 요청을 인덱스로 매칭하여 재귀
             for idx, src_node in enumerate(chunk):
+                counter["done"] += 1
+                if progress_cb:
+                    pct = int(min(99, (counter["done"] / max(1, total)) * 100))
+                    progress_cb(pct, f"Creating {counter['done']}/{total}")
+
                 created = results[idx] if idx < len(results) else {}
                 created_id = created.get("id")
-                # 자식이 있으면 재귀
                 if src_node.get("has_children") and src_node.get("children"):
-                    # created_id가 없으면(실패) 상위 ID로라도 도전(안전장치)
-                    next_parent = created_id or parent_id
-                    await self._append_children_recursive(next_parent, src_node["children"], asset_url_map)
+                    await self._append_children_recursive(
+                        created_id or parent_id, src_node["children"], asset_map, progress_cb, counter, total
+                    )
 
     async def migrate_under(
         self,
         target_page_id: str,
         tree: Dict[str, Any],
-        asset_url_map: Optional[Dict[str, List[str]]] = None
+        asset_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+        progress_cb: Optional[Callable[[int, str], None]] = None,
     ):
-        """
-        완전 재귀 마이그레이션:
-        - tree의 최상위 children을 target_page_id 하위에 append
-        - 응답으로 받은 각 블록 ID를 parent로, 그 블록의 children을 또 append
-        - 이를 깊이 끝까지 반복
-        """
-        asset_url_map = asset_url_map or {}
+        if progress_cb: progress_cb(1, "Normalizing target page ID")
+        target_page_id = normalize_notion_id(target_page_id)
+
+        asset_map = asset_map or {}
         children = tree.get("children", [])
-        await self._append_children_recursive(target_page_id, children, asset_url_map)
+
+        def count_nodes(n: Dict[str, Any]) -> int:
+            return 1 + sum(count_nodes(c) for c in n.get("children", []))
+        total = max(1, sum(count_nodes(c) for c in children))
+        counter = {"done": 0}
+        if progress_cb: progress_cb(3, "Starting children creation (upload mode)")
+
+        await self._append_children_recursive(target_page_id, children, asset_map, progress_cb, counter, total)
+        if progress_cb: progress_cb(100, "Complete")
