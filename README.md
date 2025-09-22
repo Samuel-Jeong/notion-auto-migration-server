@@ -124,17 +124,123 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ## ⚙️ 설정
 
-### config.yaml
-```yaml
-notion_api_token: "secret_xxxxxxxxxxxxx"
-static_base_url: "http://localhost:8000/files"
-dump_root: "_dumps"
-cron: "30 2 * * *"  # 매일 02:30
+### 🔑 Notion API 토큰 설정 (필수)
 
-# 자동 덤프 대상 페이지들
-auto_dump_page_ids:
+#### 1. Notion Integration 생성
+1. [Notion 인테그레이션 페이지](https://www.notion.so/my-integrations)에 접속
+2. **"New integration"** 클릭
+3. **Integration 정보 입력:**
+   - **Name**: `notion-auto-migration` (원하는 이름)
+   - **Logo**: 선택사항
+   - **Associated workspace**: 사용할 워크스페이스 선택
+4. **"Submit"** 클릭하여 인테그레이션 생성
+5. **"Internal Integration Token"** 복사 (예: `secret_ABC123...` 또는 `ntn_ABC123...`)
+
+#### 2. 페이지 권한 부여
+생성된 인테그레이션을 사용할 노션 페이지에 권한을 부여해야 합니다:
+
+1. **노션 페이지 열기** (덤프하려는 페이지)
+2. 페이지 우상단 **"..."** (더보기) 메뉴 클릭
+3. **"Add connections"** 또는 **"연결 추가"** 클릭
+4. 앞서 생성한 인테그레이션 선택 (예: `notion-auto-migration`)
+5. **"Confirm"** 또는 **"확인"** 클릭
+
+⚠️ **중요**: 각 덤프하려는 페이지마다 이 권한 부여 과정을 반복해야 합니다!
+
+### 📄 Notion 페이지 ID 찾기
+
+#### 방법 1: 브라우저 URL에서 추출 (권장)
+```
+https://www.notion.so/workspace/Page-Title-32자리ID?pvs=4
+                                    ^^^^^^^^^^^^^^^^
+                                    이 32자리가 페이지 ID
+```
+
+**예시:**
+```
+URL: https://www.notion.so/jamesj/My-Project-6df9171ff9ce4041a3a6e814a120c92d?pvs=4
+페이지 ID: 6df9171ff9ce4041a3a6e814a120c92d
+```
+
+#### 방법 2: 페이지 공유 링크 사용
+1. 노션 페이지에서 **"Share"** 또는 **"공유"** 버튼 클릭
+2. **"Copy link"** 또는 **"링크 복사"** 클릭
+3. 복사된 링크에서 32자리 ID 추출 또는 **전체 URL 사용 가능**
+
+**두 가지 모두 지원:**
+```yaml
+# 페이지 ID만 사용
+AUTO_DUMP_PAGE_IDS:
+  - "6df9171ff9ce4041a3a6e814a120c92d"
+
+# 전체 URL 사용 (자동으로 ID 추출됨)
+AUTO_DUMP_PAGE_IDS:
+  - "https://www.notion.so/workspace/Page-Title-6df9171ff9ce4041a3a6e814a120c92d?pvs=4"
+```
+
+### 📋 config.yaml 설정
+
+#### 기본 설정 파일
+```yaml
+# 🔑 필수: Notion API 토큰
+NOTION_TOKEN: "secret_your_integration_token_here"
+
+# 🌐 서버 설정
+STATIC_BASE_URL: "http://localhost:8000/files"  # 정적 파일 서빙 URL
+DUMP_ROOT: "./_dumps"                           # 덤프 저장 디렉토리
+
+# ⏰ 자동 덤프 스케줄 (CRON 형식)
+CRON: "30 2 * * *"  # 매일 02:30 (Asia/Seoul 기준)
+
+# 📄 자동 덤프 대상 페이지들 (권장: 리스트 형식)
+AUTO_DUMP_PAGE_IDS:
+  - "6df9171ff9ce4041a3a6e814a120c92d"  # 페이지 ID만
+  - "https://www.notion.so/workspace/Another-Page-abc123def456?pvs=4"  # 전체 URL
+
+# 🔧 API 설정 (선택사항)
+NOTION_TIMEOUT: 15      # API 타임아웃 (초)
+NOTION_MAX_RETRIES: 3   # API 재시도 횟수
+
+# 📁 파일 업로드 설정 (선택사항)
+ASSET_MODE: "upload"           # upload 또는 link
+ASSET_UPLOAD_MAX_MB: 100       # 최대 업로드 파일 크기 (MB)
+```
+
+#### 고급 설정 예시
+
+**1. 여러 페이지 자동 덤프**
+```yaml
+AUTO_DUMP_PAGE_IDS:
   - "page-id-1"
   - "page-id-2"
+  - "page-id-3"
+  - "https://www.notion.so/workspace/Full-URL-page-id-4"
+```
+
+**2. 다양한 페이지 ID 형식 (모두 지원)**
+```yaml
+AUTO_DUMP_PAGE_IDS:
+  - "6df9171ff9ce4041a3a6e814a120c92d"                                    # 순수 ID
+  - "6df9171f-f9ce-4041-a3a6-e814a120c92d"                                # 하이픈 포함
+  - "https://www.notion.so/workspace/Page-Title-6df9171ff9ce4041a3a6e814a120c92d"  # 전체 URL
+  - "https://www.notion.so/6df9171ff9ce4041a3a6e814a120c92d?pvs=4"         # 파라미터 포함
+```
+
+**3. 콤마/공백 구분 문자열 (하나의 문자열로 여러 ID)**
+```yaml
+AUTO_DUMP_PAGE_IDS:
+  - "page-id-1, page-id-2 page-id-3"  # 콤마와 공백으로 구분
+```
+
+**4. 프로덕션 환경 설정**
+```yaml
+NOTION_TOKEN: "secret_production_token"
+STATIC_BASE_URL: "https://your-domain.com/files"
+DUMP_ROOT: "/data/dumps"
+CRON: "0 3 * * *"                      # 매일 03:00 실행
+LOG_LEVEL: "WARNING"                   # 로그 레벨 조정
+NOTION_TIMEOUT: 30                     # 프로덕션에서는 더 긴 타임아웃
+NOTION_MAX_RETRIES: 5                  # 더 많은 재시도
 ```
 
 ### 환경 변수
@@ -151,6 +257,44 @@ UVICORN_WORKERS=1
 # 타임존
 TZ=Asia/Seoul
 ```
+
+### 🚀 빠른 설정 체크리스트
+
+설정 과정을 단계별로 확인하세요:
+
+**1단계: Notion Integration 준비 ✅**
+- [ ] [Notion 인테그레이션 페이지](https://www.notion.so/my-integrations) 접속
+- [ ] "New integration" 생성 완료
+- [ ] Internal Integration Token 복사 (`secret_...` 또는 `ntn_...`)
+
+**2단계: 페이지 권한 설정 ✅**  
+- [ ] 덤프할 노션 페이지 열기
+- [ ] 페이지 우상단 `...` → `Add connections` 클릭
+- [ ] 생성한 인테그레이션 선택 및 권한 부여
+- [ ] 모든 덤프 대상 페이지에 반복 적용
+
+**3단계: 페이지 ID 수집 ✅**
+- [ ] 브라우저 URL에서 32자리 페이지 ID 추출
+- [ ] 또는 전체 공유 링크 복사 (자동 추출 지원)
+
+**4단계: config.yaml 설정 ✅**
+```yaml
+NOTION_TOKEN: "여기에_복사한_토큰_붙여넣기"
+AUTO_DUMP_PAGE_IDS:
+  - "페이지ID1"
+  - "페이지ID2"  # 필요한 만큼 추가
+```
+
+**5단계: 테스트 실행 ✅**
+```bash
+# 서버 시작
+./bin/app.sh  # 또는 docker-compose up
+
+# 브라우저에서 확인
+http://localhost:8000
+```
+
+⚠️ **설정 실패 시**: 아래 트러블슈팅 섹션 참조
 
 ---
 
@@ -236,16 +380,74 @@ curl -N "http://localhost:8000/jobs/stream"
 **1. 노션 API 토큰 오류**
 ```
 401 Unauthorized: Invalid token
+HTTPError: 401 Client Error: Unauthorized for url: https://api.notion.com/v1/...
 ```
-- `config.yaml`의 `notion_api_token` 확인
-- [노션 인테그레이션](https://www.notion.so/my-integrations) 페이지에서 새 토큰 생성
+**해결 방법:**
+- `config.yaml`의 `NOTION_TOKEN` 값이 올바른지 확인
+- 토큰이 `secret_` 또는 `ntn_`으로 시작하는지 확인
+- [노션 인테그레이션 페이지](https://www.notion.so/my-integrations)에서 토큰 재생성
+- 토큰 복사 시 앞뒤 공백이 없는지 확인
+- 따옴표 안에 토큰을 올바르게 넣었는지 확인: `"secret_abc123..."`
 
 **2. 페이지 접근 권한 오류**
 ```
 403 Forbidden: Access denied
+HTTPError: 403 Client Error: Forbidden for url: https://api.notion.com/v1/blocks/...
 ```
-- 인테그레이션을 해당 페이지에 초대했는지 확인
-- 페이지 공유 설정에서 인테그레이션 권한 부여
+**해결 방법:**
+- 인테그레이션을 해당 페이지에 **반드시 초대**했는지 확인
+- 페이지 우상단 `...` → `Add connections` → 인테그레이션 선택
+- 부모 페이지뿐만 아니라 **모든 하위 페이지**에도 권한이 필요한 경우 각각 초대
+- 워크스페이스 관리자 권한이 있는 계정으로 로그인했는지 확인
+
+**3. 페이지 ID 형식 오류**
+```
+400 Bad Request: Invalid page ID
+ValidationError: page_id must be a valid UUID
+```
+**해결 방법:**
+- 페이지 ID가 32자리 16진수인지 확인 (예: `6df9171ff9ce4041a3a6e814a120c92d`)
+- URL에서 올바르게 추출했는지 확인:
+  ```
+  ❌ 잘못된 예: "My-Project-6df9171ff9ce4041a3a6e814a120c92d"
+  ✅ 올바른 예: "6df9171ff9ce4041a3a6e814a120c92d"
+  ```
+- 전체 URL을 사용하는 경우 시스템이 자동으로 ID를 추출하므로 문제없음
+
+**4. 페이지를 찾을 수 없음**
+```
+404 Not Found: Page not found
+```
+**해결 방법:**
+- 페이지가 실제로 존재하는지 브라우저에서 확인
+- 페이지가 삭제되거나 이동되지 않았는지 확인  
+- 정확한 페이지 URL/ID를 사용하고 있는지 재확인
+- 다른 워크스페이스의 페이지는 아닌지 확인
+
+**5. 인테그레이션 토큰 타입 오류**
+```
+Error: This endpoint requires an integration token
+```
+**해결 방법:**
+- **Internal Integration Token**을 사용해야 함 (User Token 아님)
+- [노션 인테그레이션 페이지](https://www.notion.so/my-integrations)에서 생성한 토큰 사용
+- `secret_`으로 시작하는 Internal Integration Token 확인
+
+**6. YAML 설정 파일 오류**
+```
+yaml.parser.ParserError: while parsing...
+ValueError: config.yaml top level must be a mapping (dict)
+```
+**해결 방법:**
+- YAML 문법이 올바른지 확인 (들여쓰기, 콜론, 따옴표)
+- 온라인 YAML 검증기로 문법 검사
+- 예시 설정 파일과 비교하여 구조 확인:
+  ```yaml
+  NOTION_TOKEN: "your_token_here"  # 따옴표 필수
+  AUTO_DUMP_PAGE_IDS:              # 콜론 후 공백
+    - "page-id-1"                  # 리스트 항목 앞에 하이픈과 공백
+    - "page-id-2"
+  ```
 
 **3. 파일 다운로드 실패**
 - 네트워크 연결 상태 확인
