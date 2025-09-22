@@ -96,7 +96,8 @@ class JobManager:
             if job.status in ("done", "error", "canceled"):
                 return True
             job.cancel_event.set()
-            job.message = "Cancelling..."
+            job.status = "canceled"
+            job.message = "Cancelled"
             await self._broadcast_update(job)
             return True
 
@@ -136,6 +137,10 @@ class JobManager:
         await self._broadcast_added(job)
 
         async def runner():
+            # Check if job was already canceled before starting
+            if job.cancel_event.is_set():
+                return  # Job already canceled, don't override status
+                
             job.status = "running"
             await self._tick(job, 0, "Starting")
             svc = NotionDumpService(self.settings)
@@ -148,15 +153,16 @@ class JobManager:
                     return job.cancel_event.is_set()
 
                 path = await svc.dump_page_tree(page_id, progress_cb=_progress, cancel_cb=_cancelled)
-                if job.cancel_event.is_set():
+                if job.cancel_event.is_set() and job.status != "canceled":
                     job.status = "canceled"
                     await self._tick(job, job.progress, "Cancelled")
-                else:
+                elif not job.cancel_event.is_set():
                     job.status = "done"
                     await self._tick(job, 100, f"Complete: {path}")
             except asyncio.CancelledError:
-                job.status = "canceled"
-                await self._tick(job, job.progress, "Cancelled")
+                if job.status != "canceled":
+                    job.status = "canceled"
+                    await self._tick(job, job.progress, "Cancelled")
             except Exception as e:
                 job.status = "error"
                 await self._tick(job, job.progress, f"Error: {e}")
@@ -175,6 +181,10 @@ class JobManager:
         await self._broadcast_added(job)
 
         async def runner():
+            # Check if job was already canceled before starting
+            if job.cancel_event.is_set():
+                return  # Job already canceled, don't override status
+                
             job.status = "running"
             await self._tick(job, 0, "Starting")
             svc = NotionMigrateService(self.settings)
@@ -203,16 +213,17 @@ class JobManager:
                 from .routers.api import _build_asset_map_from_manifest
                 asset_map = _build_asset_map_from_manifest(manifest, self.settings)
 
-                await svc.migrate_under(target_page_id, tree, asset_map, progress_cb=_progress)
-                if job.cancel_event.is_set():
+                await svc.migrate_under(target_page_id, tree, asset_map, progress_cb=_progress, cancel_cb=_cancelled)
+                if job.cancel_event.is_set() and job.status != "canceled":
                     job.status = "canceled"
                     await self._tick(job, job.progress, "Cancelled")
-                else:
+                elif not job.cancel_event.is_set():
                     job.status = "done"
                     await self._tick(job, 100, "Complete")
             except asyncio.CancelledError:
-                job.status = "canceled"
-                await self._tick(job, job.progress, "Cancelled")
+                if job.status != "canceled":
+                    job.status = "canceled"
+                    await self._tick(job, job.progress, "Cancelled")
             except Exception as e:
                 job.status = "error"
                 await self._tick(job, job.progress, f"Error: {e}")

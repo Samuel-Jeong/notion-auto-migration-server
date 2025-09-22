@@ -177,11 +177,15 @@ class NotionMigrateService:
         progress_cb: Optional[Callable[[int, str], None]],
         counter: Dict[str, int],
         total: int,
+        check_cancel: Callable[[], None],
     ):
         if not src_children:
             return
 
         for i in range(0, len(src_children), APPEND_LIMIT):
+            # Check for cancellation before processing each chunk
+            check_cancel()
+            
             chunk = src_children[i:i + APPEND_LIMIT]
 
             payload_chunk: List[Dict[str, Any]] = []
@@ -194,6 +198,8 @@ class NotionMigrateService:
             except Exception:
                 results = []
                 for n in chunk:
+                    # Check for cancellation before each retry
+                    check_cancel()
                     try:
                         single = await self._node_to_block_payload(n, asset_map)
                         r = await run_in_threadpool(self._append_children, parent_id, [single])
@@ -211,7 +217,7 @@ class NotionMigrateService:
                 created_id = created.get("id")
                 if src_node.get("has_children") and src_node.get("children"):
                     await self._append_children_recursive(
-                        created_id or parent_id, src_node["children"], asset_map, progress_cb, counter, total
+                        created_id or parent_id, src_node["children"], asset_map, progress_cb, counter, total, check_cancel
                     )
 
     async def migrate_under(
@@ -220,7 +226,12 @@ class NotionMigrateService:
         tree: Dict[str, Any],
         asset_map: Optional[Dict[str, List[Dict[str, Any]]]] = None,
         progress_cb: Optional[Callable[[int, str], None]] = None,
+        cancel_cb: Optional[Callable[[], bool]] = None,
     ):
+        def check_cancel():
+            if cancel_cb and cancel_cb():
+                raise asyncio.CancelledError()
+
         if progress_cb: progress_cb(1, "Normalizing target page ID")
         target_page_id = normalize_notion_id(target_page_id)
 
@@ -233,5 +244,5 @@ class NotionMigrateService:
         counter = {"done": 0}
         if progress_cb: progress_cb(3, "Starting children creation (upload mode)")
 
-        await self._append_children_recursive(target_page_id, children, asset_map, progress_cb, counter, total)
+        await self._append_children_recursive(target_page_id, children, asset_map, progress_cb, counter, total, check_cancel)
         if progress_cb: progress_cb(100, "Complete")
