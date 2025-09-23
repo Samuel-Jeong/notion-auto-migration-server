@@ -12,7 +12,7 @@ from .config import Settings
 from .utils_id import normalize_notion_id
 
 APPEND_LIMIT = 100
-ASSET_BLOCK_TYPES = ("image", "file", "pdf", "video", "audio")
+ASSET_BLOCK_TYPES = ("image", "file", "pdf", "video", "audio", "external")
 NOTION_VERSION = "2022-06-28"   # File upload endpoint supported version
 
 # Upload allowed capacity (default 20MB)
@@ -38,6 +38,24 @@ class NotionMigrateService:
     @notion_retry()
     def _append_children(self, parent_block_id: str, children: List[Dict[str, Any]]) -> Dict[str, Any]:
         return self.client.blocks.children.append(block_id=parent_block_id, children=children)
+
+    @notion_retry()
+    def _create_child_page(self, parent_page_id: str, title: str, children: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Create a child page under the specified parent page"""
+        page_data = {
+            "parent": {"page_id": parent_page_id},
+            "properties": {
+                "title": {
+                    "title": [{"type": "text", "text": {"content": title}}]
+                }
+            }
+        }
+        
+        # Add children blocks if provided
+        if children:
+            page_data["children"] = children
+        
+        return self.client.pages.create(**page_data)
 
     # -------------------------------
     # Notion File Uploads API
@@ -182,12 +200,50 @@ class NotionMigrateService:
         if not src_children:
             return
 
-        for i in range(0, len(src_children), APPEND_LIMIT):
-            # Check for cancellation before processing each chunk
+        # Process all blocks in their original order to preserve positioning
+        regular_block_batch = []
+        
+        for node in src_children:
             check_cancel()
             
-            chunk = src_children[i:i + APPEND_LIMIT]
+            if node.get("type") == "child_page":
+                # Before processing a child_page, first append any batched regular blocks
+                if regular_block_batch:
+                    await self._process_regular_blocks_batch(
+                        parent_id, regular_block_batch, asset_map, progress_cb, counter, total, check_cancel
+                    )
+                    regular_block_batch = []
+                
+                # Process child_page block immediately to maintain order
+                await self._process_child_page_block(
+                    parent_id, node, asset_map, progress_cb, counter, total, check_cancel
+                )
+            else:
+                # Accumulate regular blocks for batch processing
+                regular_block_batch.append(node)
+        
+        # Process any remaining regular blocks at the end
+        if regular_block_batch:
+            await self._process_regular_blocks_batch(
+                parent_id, regular_block_batch, asset_map, progress_cb, counter, total, check_cancel
+            )
 
+    async def _process_regular_blocks_batch(
+        self,
+        parent_id: str,
+        regular_blocks: List[Dict[str, Any]],
+        asset_map: Dict[str, List[Dict[str, Any]]],
+        progress_cb: Optional[Callable[[int, str], None]],
+        counter: Dict[str, int],
+        total: int,
+        check_cancel: Callable[[], None],
+    ):
+        """Process a batch of regular blocks in chunks"""
+        for i in range(0, len(regular_blocks), APPEND_LIMIT):
+            check_cancel()
+            
+            chunk = regular_blocks[i:i + APPEND_LIMIT]
+            
             payload_chunk: List[Dict[str, Any]] = []
             for n in chunk:
                 payload_chunk.append(await self._node_to_block_payload(n, asset_map))
@@ -198,7 +254,6 @@ class NotionMigrateService:
             except Exception:
                 results = []
                 for n in chunk:
-                    # Check for cancellation before each retry
                     check_cancel()
                     try:
                         single = await self._node_to_block_payload(n, asset_map)
@@ -219,6 +274,45 @@ class NotionMigrateService:
                     await self._append_children_recursive(
                         created_id or parent_id, src_node["children"], asset_map, progress_cb, counter, total, check_cancel
                     )
+
+    async def _process_child_page_block(
+        self,
+        parent_id: str,
+        child_page_node: Dict[str, Any],
+        asset_map: Dict[str, List[Dict[str, Any]]],
+        progress_cb: Optional[Callable[[int, str], None]],
+        counter: Dict[str, int],
+        total: int,
+        check_cancel: Callable[[], None],
+    ):
+        """Process a single child_page block"""
+        check_cancel()
+        
+        # Extract page title from child_page data
+        child_page_data = child_page_node.get("child_page", {})
+        page_title = child_page_data.get("title", "Untitled Page")
+        
+        try:
+            # Create the child page
+            page_resp = await run_in_threadpool(self._create_child_page, parent_id, page_title)
+            created_page_id = page_resp.get("id")
+            
+            counter["done"] += 1
+            if progress_cb:
+                pct = int(min(99, (counter["done"] / max(1, total)) * 100))
+                progress_cb(pct, f"Creating page '{page_title}' {counter['done']}/{total}")
+            
+            logger.info(f"Successfully created child page '{page_title}' with ID {created_page_id} in original position")
+            
+            # Recursively migrate the page's children to the newly created page
+            if child_page_node.get("has_children") and child_page_node.get("children") and created_page_id:
+                await self._append_children_recursive(
+                    created_page_id, child_page_node["children"], asset_map, progress_cb, counter, total, check_cancel
+                )
+                
+        except Exception as e:
+            logger.error(f"Failed to create child page '{page_title}': {e}")
+            counter["done"] += 1
 
     async def migrate_under(
         self,

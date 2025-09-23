@@ -102,3 +102,26 @@ async def ui_migrate(target_page_id: str = Form(...),
     msvc = NotionMigrateService(settings)
     await msvc.migrate_under(target_page_id, tree, asset_map)
     return RedirectResponse(url="/?ok=migrated", status_code=303)
+
+@router.post("/ui/delete", response_class=RedirectResponse)
+async def ui_delete_dump(dump_name: str = Form(...),
+                         settings: Settings = Depends(require_settings)):
+    # Validate dump_name to prevent path traversal
+    dump_name = dump_name.strip()
+    if not dump_name or ".." in dump_name or "/" in dump_name or "\\" in dump_name:
+        return RedirectResponse(url="/?err=invalid_dump_name", status_code=303)
+    
+    dump_path = os.path.join(settings.DUMP_ROOT, dump_name)
+    if not os.path.isdir(dump_path):
+        return RedirectResponse(url="/?err=dump_not_found", status_code=303)
+    
+    try:
+        import shutil
+        shutil.rmtree(dump_path)
+        return RedirectResponse(url="/?ok=deleted", status_code=303)
+    except FileNotFoundError:
+        return RedirectResponse(url="/?err=dump_not_found", status_code=303)
+    except PermissionError:
+        return RedirectResponse(url="/?err=permission_denied", status_code=303)
+    except OSError:
+        return RedirectResponse(url="/?err=delete_failed", status_code=303)

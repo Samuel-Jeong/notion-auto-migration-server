@@ -13,7 +13,7 @@ from .notion_client import build_client, notion_retry
 from .config import Settings
 from .utils_id import normalize_notion_id
 
-ASSET_TYPES = {"image", "file", "pdf", "video", "audio"}
+ASSET_TYPES = {"image", "file", "pdf", "video", "audio", "external"}
 ASSET_CONCURRENCY = 5
 ASSET_CHUNK = 128 * 1024
 

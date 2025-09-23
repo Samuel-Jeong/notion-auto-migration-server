@@ -67,6 +67,7 @@
             <th>덤프 이름</th>
             <th>상태</th>
             <th>링크</th>
+            <th>작업</th>
           </tr>
         </thead>
         <tbody id="dumpTbody">
@@ -75,11 +76,14 @@
               <td>{{ d.name }}</td>
               <td><span class="pill ok">완료</span></td>
               <td><a href="/api/browse/{{ d.name }}/" target="_blank">/api/browse/{{ d.name }}/</a></td>
+              <td>
+                <button class="btn" onclick="deleteDump('{{ d.name }}')">삭제</button>
+              </td>
             </tr>
           {% endfor %}
           {% if not dumps %}
             <tr>
-              <td colspan="3" style="text-align: center; color: #666; padding: 32px;">
+              <td colspan="4" style="text-align: center; color: #666; padding: 32px;">
                 덤프가 없습니다. 위에서 새 덤프를 생성해보세요.
               </td>
             </tr>
@@ -127,6 +131,35 @@ document.getElementById('migForm').addEventListener('submit', async (e)=>{
 });
 
 /* ────────────────────────────────
+   덤프 삭제 기능
+   ──────────────────────────────── */
+async function deleteDump(dumpName) {
+  if (!confirm(`덤프 "${dumpName}"을(를) 정말 삭제하시겠습니까?\n\n이 작업은 되돌릴 수 없습니다.`)) {
+    return;
+  }
+  
+  try {
+    const form = new FormData();
+    form.append('dump_name', dumpName);
+    
+    const response = await fetch('/ui/delete', {
+      method: 'POST',
+      body: form
+    });
+    
+    if (response.ok) {
+      // 성공 시 페이지 새로고침하여 목록 업데이트
+      window.location.reload();
+    } else {
+      alert('덤프 삭제에 실패했습니다.');
+    }
+  } catch (error) {
+    console.error('Delete error:', error);
+    alert('덤프 삭제 중 오류가 발생했습니다.');
+  }
+}
+
+/* ────────────────────────────────
    덤프 목록 렌더링
    ──────────────────────────────── */
 const tbody = document.getElementById('dumpTbody');
@@ -140,6 +173,7 @@ function rowHTML(it){
       <td>${it.name}</td>
       <td>${status}</td>
       <td><a href="${it.static_url}" target="_blank">${it.static_url}</a></td>
+      <td><button class="btn" onclick="deleteDump('${it.name}')">삭제</button></td>
     </tr>
   `;
 }
