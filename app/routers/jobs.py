@@ -30,6 +30,14 @@ async def create_dump(payload: Dict[str, Any] = Body(...), mgr: JobManager = Dep
     job = await mgr.enqueue_dump(page_id)
     return {"ok": True, "job": job.to_dict()}
 
+@router.post("/dump_database")
+async def create_dump_database(payload: Dict[str, Any] = Body(...), mgr: JobManager = Depends(get_manager)):
+    database_id = (payload.get("database_id") or "").strip()
+    if not database_id:
+        raise HTTPException(400, "database_id is required")
+    job = await mgr.enqueue_dump_database(database_id)
+    return {"ok": True, "job": job.to_dict()}
+
 @router.post("/migrate")
 async def create_migrate(payload: Dict[str, Any] = Body(...), mgr: JobManager = Depends(get_manager)):
     dump_name = (payload.get("dump_name") or "").strip()
@@ -73,3 +81,63 @@ async def stream_jobs(request: Request, mgr: JobManager = Depends(get_manager)):
             mgr.unsubscribe(q)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+@router.get("/history")
+async def get_job_history(days: int = 7, mgr: JobManager = Depends(get_manager)):
+    """Get job history for the last N days"""
+    history = await mgr.history.get_recent_history(days=days)
+    return {"history": history}
+
+@router.get("/history/dates")
+async def get_available_dates(mgr: JobManager = Depends(get_manager)):
+    """Get list of available dates with job history"""
+    dates = await mgr.history.get_available_dates()
+    return {"dates": dates}
+
+@router.get("/history/{date}")
+async def get_daily_history(date: str, mgr: JobManager = Depends(get_manager)):
+    """Get job history for a specific date (YYYY-MM-DD format)"""
+    from datetime import datetime
+    try:
+        target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        jobs = await mgr.history.get_daily_history(target_date)
+        return {"date": date, "jobs": jobs}
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
+
+@router.get("/history/range")
+async def get_history_range(
+    start_date: str, 
+    end_date: str, 
+    job_type: str = None, 
+    status: str = None,
+    mgr: JobManager = Depends(get_manager)
+):
+    """Get job history for a date range with optional filtering"""
+    from datetime import datetime
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        
+        if start > end:
+            raise HTTPException(400, "start_date must be before or equal to end_date")
+        
+        history = await mgr.history.get_history_range(start, end, job_type, status)
+        return {
+            "start_date": start_date,
+            "end_date": end_date,
+            "job_type": job_type,
+            "status": status,
+            "history": history
+        }
+    except ValueError:
+        raise HTTPException(400, "Invalid date format. Use YYYY-MM-DD")
+
+@router.get("/statistics")
+async def get_job_statistics(days: int = 30, mgr: JobManager = Depends(get_manager)):
+    """Get job statistics for the last N days"""
+    if days < 1 or days > 365:
+        raise HTTPException(400, "days must be between 1 and 365")
+    
+    stats = await mgr.history.get_job_statistics(days)
+    return {"days": days, "statistics": stats}

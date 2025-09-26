@@ -165,19 +165,37 @@ import asyncio
 scheduler_queue: asyncio.Queue = asyncio.Queue()
 
 def _effective_auto_ids():
-    ids = []
+    """Get both page and database IDs for auto-dumping"""
+    page_ids = []
     if hasattr(settings, "auto_dump_ids") and callable(getattr(settings, "auto_dump_ids")):
-        ids.extend(settings.auto_dump_ids())
+        page_ids.extend(settings.auto_dump_ids())
     else:
         if getattr(settings, "AUTO_DUMP_PAGE_ID", ""):
-            ids.append(settings.AUTO_DUMP_PAGE_ID)
-    # dedup
-    out, seen = [], set()
-    for v in ids:
+            page_ids.append(settings.AUTO_DUMP_PAGE_ID)
+    
+    # Get database IDs
+    database_ids = []
+    if hasattr(settings, "auto_dump_database_ids") and callable(getattr(settings, "auto_dump_database_ids")):
+        database_ids.extend(settings.auto_dump_database_ids())
+    else:
+        if getattr(settings, "AUTO_DUMP_DATABASE_ID", ""):
+            database_ids.append(settings.AUTO_DUMP_DATABASE_ID)
+    
+    # Deduplicate pages
+    page_out, page_seen = [], set()
+    for v in page_ids:
         s = (v or "").strip()
-        if s and s not in seen:
-            out.append(s); seen.add(s)
-    return out
+        if s and s not in page_seen:
+            page_out.append(s); page_seen.add(s)
+    
+    # Deduplicate databases
+    db_out, db_seen = [], set()
+    for v in database_ids:
+        s = (v or "").strip()
+        if s and s not in db_seen:
+            db_out.append(s); db_seen.add(s)
+    
+    return {"pages": page_out, "databases": db_out}
 
 def _build_cron_trigger(expr: str) -> CronTrigger:
     try:
@@ -194,12 +212,15 @@ def _auto_dump_job():
     """Called by APScheduler from background thread - put request in queue for main loop to process"""
     try:
         ids = _effective_auto_ids()
-        if not ids:
-            logger.info("[AUTO_DUMP] No target page IDs found. Skipping.")
+        page_ids = ids.get("pages", [])
+        database_ids = ids.get("databases", [])
+        
+        if not page_ids and not database_ids:
+            logger.info("[AUTO_DUMP] No target page or database IDs found. Skipping.")
             return
         # Put the dump request in the queue for async processing
-        scheduler_queue.put_nowait({"type": "auto_dump", "page_ids": ids})
-        logger.info(f"[AUTO_DUMP] Queued auto dump request for {len(ids)} page(s)")
+        scheduler_queue.put_nowait({"type": "auto_dump", "page_ids": page_ids, "database_ids": database_ids})
+        logger.info(f"[AUTO_DUMP] Queued auto dump request for {len(page_ids)} page(s) and {len(database_ids)} database(s)")
     except Exception as e:
         logger.exception(f"[AUTO_DUMP] Error queuing auto dump: {e}")
 
@@ -212,15 +233,26 @@ async def _process_scheduler_queue():
             request = await scheduler_queue.get()
             if request.get("type") == "auto_dump":
                 page_ids = request.get("page_ids", [])
-                logger.info(f"[AUTO_DUMP] Processing auto dump request for {len(page_ids)} page(s)")
+                database_ids = request.get("database_ids", [])
+                logger.info(f"[AUTO_DUMP] Processing auto dump request for {len(page_ids)} page(s) and {len(database_ids)} database(s)")
                 
                 mgr = await get_jobs_manager(settings)
+                
+                # Process pages
                 for pid in page_ids:
                     try:
                         await mgr.enqueue_dump(pid)
-                        logger.info(f"[AUTO_DUMP] queued: {pid}")
+                        logger.info(f"[AUTO_DUMP] queued page: {pid}")
                     except Exception as e:
-                        logger.exception(f"[AUTO_DUMP] enqueue failed: {pid} err={e}")
+                        logger.exception(f"[AUTO_DUMP] enqueue page failed: {pid} err={e}")
+                
+                # Process databases
+                for db_id in database_ids:
+                    try:
+                        await mgr.enqueue_dump_database(db_id)
+                        logger.info(f"[AUTO_DUMP] queued database: {db_id}")
+                    except Exception as e:
+                        logger.exception(f"[AUTO_DUMP] enqueue database failed: {db_id} err={e}")
             
             scheduler_queue.task_done()
         except Exception as e:
@@ -229,7 +261,11 @@ async def _process_scheduler_queue():
 
 def _maybe_start_scheduler():
     ids = _effective_auto_ids()
-    if not ids:
+    page_count = len(ids.get("pages", []))
+    db_count = len(ids.get("databases", []))
+    total_count = page_count + db_count
+    
+    if total_count == 0:
         logger.info("[AUTO_DUMP] No auto dump targets found, scheduler not started.")
         return
     try:
@@ -239,7 +275,7 @@ def _maybe_start_scheduler():
         return
     scheduler.add_job(_auto_dump_job, trigger=trigger, id="auto_dump", replace_existing=True)
     scheduler.start()
-    logger.info(f"[AUTO_DUMP] Scheduler started: CRON='{settings.CRON}', targets={len(ids)}")
+    logger.info(f"[AUTO_DUMP] Scheduler started: CRON='{settings.CRON}', targets={total_count} ({page_count} pages, {db_count} databases)")
 
 @app.on_event("startup")
 async def _on_startup():

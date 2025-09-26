@@ -24,7 +24,34 @@
     .pill { font-size:12px; padding:2px 6px; border-radius:999px; background:#eee; }
     .pill.ok { background:#e6f6e6; }
     .pill.wait { background:#f6f0e6; }
+    .pill.page { background: #e3f2fd; color: #1565c0; }
+    .pill.database { background: #f3e5f5; color: #7b1fa2; }
+    .pill.images { background: #e8f5e8; color: #2e7d32; }
+    .pill.attachments { background: #fff8e1; color: #f57c00; }
+    .quality-high { width: 8px; height: 8px; border-radius: 50%; background: #28a745; display: inline-block; margin-left: 8px; }
+    .quality-medium { width: 8px; height: 8px; border-radius: 50%; background: #ffc107; display: inline-block; margin-left: 8px; }
+    .quality-low { width: 8px; height: 8px; border-radius: 50%; background: #6c757d; display: inline-block; margin-left: 8px; }
     .actions { display:flex; gap:6px; }
+    .tab-nav { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid #ddd; }
+    .tab-btn { 
+      padding: 8px 16px; 
+      border: none; 
+      background: #f5f5f5; 
+      border-radius: 8px 8px 0 0; 
+      cursor: pointer; 
+      font-size: 14px;
+      color: #666;
+      transition: all 0.2s;
+    }
+    .tab-btn:hover { background: #e5e5e5; }
+    .tab-btn.active { 
+      background: #fff; 
+      color: #000; 
+      border-bottom: 2px solid #4f46e5;
+      font-weight: 500;
+    }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
   </style>
 </head>
 <body>
@@ -35,7 +62,11 @@
     <div class="card">
       <h2>덤프</h2>
       <form id="dumpForm">
-        <input type="text" name="page_id" placeholder="노션 루트 페이지 ID 또는 URL" style="flex:1" required />
+        <select name="dump_type" id="dumpType" required>
+          <option value="page">페이지</option>
+          <option value="database">데이터베이스</option>
+        </select>
+        <input type="text" name="notion_id" id="notionIdInput" placeholder="노션 페이지 ID 또는 URL" style="flex:1" required />
         <button type="submit" class="btn">시작</button>
       </form>
     </div>
@@ -43,12 +74,30 @@
     <div class="card">
       <h2>마이그레이션</h2>
       <form id="migForm">
-        <select name="dump_name" required id="dumpSelect">
-          <option value="" disabled selected>덤프 선택</option>
-          {% for d in dumps %}
-            <option value="{{ d.name }}">{{ d.name }}</option>
-          {% endfor %}
-        </select>
+        <div style="position: relative; flex: 1;">
+          <select name="dump_name" required id="dumpSelect" onchange="updateDumpInfo()">
+            <option value="" disabled selected>덤프 선택 ({{ dumps|length }}개 덤프)</option>
+            {% for d in dumps %}
+              <option value="{{ d.name }}" 
+                      data-size="{{ d.size }}" 
+                      data-pages="{{ d.pages }}" 
+                      data-files="{{ d.file_count }}"
+                      data-type="{{ d.tags|join(', ') }}"
+                      data-timestamp="{{ d.timestamp.strftime('%Y-%m-%d %H:%M') if d.timestamp else '' }}">
+                {% set quality_score = ((d.size or 0) > 0) + ((d.pages or 0) > 0) + ((d.file_count or 0) > 0) + (d.description|length > 0 if d.description else 0) %}
+                {% if quality_score >= 4 %}● {% elif quality_score >= 3 %}◐ {% else %}○ {% endif %}{{ d.name }}
+                {% if d.description %} - {{ d.description }}{% endif %}
+                {% if d.pages > 0 %} [{{ d.pages }}페이지]{% endif %}
+                {% if d.size > 0 %} [{{ (d.size / 1024 / 1024)|round(1) }}MB]{% endif %}
+                {% if d.images > 0 %} [🖼️{{ d.images }}]{% endif %}
+                {% if d.attachments > 0 %} [📎{{ d.attachments }}]{% endif %}
+              </option>
+            {% endfor %}
+          </select>
+          <div id="dumpInfo" style="display: none; position: absolute; top: 100%; left: 0; right: 0; background: white; border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-top: 4px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); z-index: 1000; font-size: 12px;">
+            <div id="dumpInfoContent"></div>
+          </div>
+        </div>
         <input type="text" name="target_page_id" placeholder="타겟 노션 페이지 ID 또는 URL" style="flex:1" required />
         <button type="submit" class="btn">시작</button>
       </form>
@@ -61,35 +110,303 @@
           <button id="refreshDumpsBtn" class="btn">새로고침</button>
         </div>
       </div>
-      <table style="width: 100%; border-collapse: collapse;">
-        <thead>
-          <tr>
-            <th>덤프 이름</th>
-            <th>상태</th>
-            <th>링크</th>
-            <th>작업</th>
-          </tr>
-        </thead>
-        <tbody id="dumpTbody">
-          {% for d in dumps %}
-            <tr>
-              <td>{{ d.name }}</td>
-              <td><span class="pill ok">완료</span></td>
-              <td><a href="/api/browse/{{ d.name }}/" target="_blank">/api/browse/{{ d.name }}/</a></td>
-              <td>
-                <button class="btn" onclick="deleteDump('{{ d.name }}')">삭제</button>
-              </td>
-            </tr>
+      
+      <!-- Professional Search and Filter Controls -->
+      <div style="background: #f8f9fa; padding: 16px; border-radius: 8px; margin: 16px 0;">
+        <div class="row" style="margin-bottom: 12px;">
+          <input type="text" id="searchInput" placeholder="🔍 덤프명, 설명, 태그로 검색..." 
+                 value="{{ current_search }}" 
+                 style="flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 6px;" />
+          <button onclick="applyFilters()" class="btn" style="margin-left: 8px;">검색</button>
+          <button onclick="clearFilters()" class="btn" style="margin-left: 4px; background: #f5f5f5;">초기화</button>
+        </div>
+        
+        <div class="row" style="gap: 12px; flex-wrap: wrap;">
+          <div>
+            <label style="font-size: 12px; color: #666;">정렬:</label>
+            <select id="sortSelect" style="padding: 6px;">
+              <option value="timestamp">최신순</option>
+              <option value="name">이름순</option>
+              <option value="size">크기순</option>
+              <option value="files">파일수순</option>
+              <option value="pages">페이지수순</option>
+            </select>
+          </div>
+          
+          <div>
+            <label style="font-size: 12px; color: #666;">타입:</label>
+            <select id="typeSelect" style="padding: 6px;">
+              <option value="">전체</option>
+              <option value="page">페이지</option>
+              <option value="database">데이터베이스</option>
+              <option value="with_images">이미지 포함</option>
+              <option value="with_attachments">첨부파일 포함</option>
+            </select>
+          </div>
+          
+          <div>
+            <label style="font-size: 12px; color: #666;">크기:</label>
+            <select id="sizeSelect" style="padding: 6px;">
+              <option value="">전체</option>
+              <option value="small">1MB 미만</option>
+              <option value="medium">1MB-10MB</option>
+              <option value="large">10MB-100MB</option>
+              <option value="xlarge">100MB 이상</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Enhanced Filter Statistics -->
+      {% if filter_stats %}
+      <div style="background: linear-gradient(135deg, #e3f2fd 0%, #f3e5f5 50%, #e8f5e8 100%); padding: 16px; border-radius: 8px; margin-bottom: 16px; border: 1px solid rgba(79, 70, 229, 0.1); box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+        <div class="row" style="margin-bottom: 8px;">
+          <div>
+            <span style="font-size: 16px; font-weight: 600; color: #1a202c;">
+              {{ filter_stats.filtered_dumps }}<span style="font-size: 14px; color: #64748b;">/{{ filter_stats.total_dumps }}</span>
+            </span>
+            <span style="font-size: 13px; color: #475569; margin-left: 4px;">개 덤프</span>
+          </div>
+          <div style="font-size: 13px; color: #64748b;">
+            {{ (filter_stats.filtered_size / 1024 / 1024)|round(1) }}MB / {{ (filter_stats.total_size / 1024 / 1024)|round(1) }}MB
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: 8px;">
+          <div style="text-align: center; padding: 6px; background: rgba(255,255,255,0.7); border-radius: 6px;">
+            <div style="font-size: 14px; font-weight: 500; color: #1565c0;">{{ filter_stats.page_dumps }}</div>
+            <div style="font-size: 10px; color: #64748b;">📄 페이지</div>
+          </div>
+          <div style="text-align: center; padding: 6px; background: rgba(255,255,255,0.7); border-radius: 6px;">
+            <div style="font-size: 14px; font-weight: 500; color: #7b1fa2;">{{ filter_stats.database_dumps }}</div>
+            <div style="font-size: 10px; color: #64748b;">🗃️ DB</div>
+          </div>
+          <div style="text-align: center; padding: 6px; background: rgba(255,255,255,0.7); border-radius: 6px;">
+            <div style="font-size: 14px; font-weight: 500; color: #2e7d32;">{{ filter_stats.with_images }}</div>
+            <div style="font-size: 10px; color: #64748b;">🖼️ 이미지</div>
+          </div>
+          <div style="text-align: center; padding: 6px; background: rgba(255,255,255,0.7); border-radius: 6px;">
+            <div style="font-size: 14px; font-weight: 500; color: #f57c00;">{{ filter_stats.with_attachments }}</div>
+            <div style="font-size: 10px; color: #64748b;">📎 첨부</div>
+          </div>
+        </div>
+      </div>
+      {% endif %}
+      
+      <!-- Pagination Controls -->
+      {% if pagination %}
+      <div style="background: #f8f9fa; padding: 16px; border-radius: 8px; margin-bottom: 16px; border: 1px solid #e9ecef;">
+        <div class="row" style="align-items: center;">
+          <div style="font-size: 14px; color: #495057;">
+            <span style="font-weight: 500;">{{ pagination.start_item }}-{{ pagination.end_item }}</span> / {{ pagination.total_items }}개 덤프
+            <span style="color: #6c757d; margin-left: 8px;">({{ pagination.current_page }}/{{ pagination.total_pages }} 페이지)</span>
+          </div>
+          
+          <div style="display: flex; gap: 8px; align-items: center;">
+            {% if pagination.has_previous %}
+              <a href="?{{ request.url.query | replace('page=' + pagination.current_page|string, 'page=' + pagination.previous_page|string) if 'page=' in (request.url.query or '') else (request.url.query + '&page=' + pagination.previous_page|string if request.url.query else 'page=' + pagination.previous_page|string) }}" 
+                 class="btn" style="font-size: 12px; padding: 6px 12px; background: #4f46e5; color: white; text-decoration: none; border-radius: 4px;">
+                ← 이전
+              </a>
+            {% else %}
+              <span class="btn" style="font-size: 12px; padding: 6px 12px; background: #e9ecef; color: #6c757d; border-radius: 4px; cursor: not-allowed;">
+                ← 이전
+              </span>
+            {% endif %}
+            
+            <!-- Page Numbers -->
+            {% set start_page = [1, pagination.current_page - 2]|max %}
+            {% set end_page = [pagination.total_pages, pagination.current_page + 2]|min %}
+            
+            {% if start_page > 1 %}
+              <a href="?{{ request.url.query | replace('page=' + pagination.current_page|string, 'page=1') if 'page=' in (request.url.query or '') else (request.url.query + '&page=1' if request.url.query else 'page=1') }}" 
+                 style="font-size: 12px; padding: 4px 8px; color: #4f46e5; text-decoration: none; border-radius: 3px;">1</a>
+              {% if start_page > 2 %}
+                <span style="color: #6c757d;">...</span>
+              {% endif %}
+            {% endif %}
+            
+            {% for page_num in range(start_page, end_page + 1) %}
+              {% if page_num == pagination.current_page %}
+                <span style="font-size: 12px; padding: 4px 8px; background: #4f46e5; color: white; border-radius: 3px; font-weight: 500;">{{ page_num }}</span>
+              {% else %}
+                <a href="?{{ request.url.query | replace('page=' + pagination.current_page|string, 'page=' + page_num|string) if 'page=' in (request.url.query or '') else (request.url.query + '&page=' + page_num|string if request.url.query else 'page=' + page_num|string) }}" 
+                   style="font-size: 12px; padding: 4px 8px; color: #4f46e5; text-decoration: none; border-radius: 3px; transition: background 0.2s;"
+                   onmouseover="this.style.background='#f8f9fa'"
+                   onmouseout="this.style.background='transparent'">{{ page_num }}</a>
+              {% endif %}
+            {% endfor %}
+            
+            {% if end_page < pagination.total_pages %}
+              {% if end_page < pagination.total_pages - 1 %}
+                <span style="color: #6c757d;">...</span>
+              {% endif %}
+              <a href="?{{ request.url.query | replace('page=' + pagination.current_page|string, 'page=' + pagination.total_pages|string) if 'page=' in (request.url.query or '') else (request.url.query + '&page=' + pagination.total_pages|string if request.url.query else 'page=' + pagination.total_pages|string) }}" 
+                 style="font-size: 12px; padding: 4px 8px; color: #4f46e5; text-decoration: none; border-radius: 3px;">{{ pagination.total_pages }}</a>
+            {% endif %}
+            
+            {% if pagination.has_next %}
+              <a href="?{{ request.url.query | replace('page=' + pagination.current_page|string, 'page=' + pagination.next_page|string) if 'page=' in (request.url.query or '') else (request.url.query + '&page=' + pagination.next_page|string if request.url.query else 'page=' + pagination.next_page|string) }}" 
+                 class="btn" style="font-size: 12px; padding: 6px 12px; background: #4f46e5; color: white; text-decoration: none; border-radius: 4px;">
+                다음 →
+              </a>
+            {% else %}
+              <span class="btn" style="font-size: 12px; padding: 6px 12px; background: #e9ecef; color: #6c757d; border-radius: 4px; cursor: not-allowed;">
+                다음 →
+              </span>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+      {% endif %}
+      
+      {% if dump_groups %}
+        <!-- Tab navigation -->
+        <div class="tab-nav">
+          {% for group in dump_groups %}
+            <button class="tab-btn {% if loop.first %}active{% endif %}" onclick="showTab('{{ group.key }}')">{{ group.key }} ({{ group.dumps|length }})</button>
           {% endfor %}
-          {% if not dumps %}
+        </div>
+        
+        <!-- Tab contents -->
+        {% for group in dump_groups %}
+          <div id="tab-{{ group.key }}" class="tab-content {% if loop.first %}active{% endif %}">
+            <table style="width: 100%; border-collapse: collapse;">
+              <thead>
+                <tr>
+                  <th>덤프 이름</th>
+                  <th>타입</th>
+                  <th>크기</th>
+                  <th>페이지/파일</th>
+                  <th>생성시간</th>
+                  <th>상태</th>
+                  <th>작업</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for d in group.dumps %}
+                  <tr>
+                    <td>
+                      <div class="row" style="align-items: flex-start;">
+                        <div style="flex: 1;">
+                          <div style="font-weight: 500;">{{ d.name }}</div>
+                          {% if d.description %}
+                            <div style="font-size: 11px; color: #666; margin-top: 2px;">{{ d.description }}</div>
+                          {% endif %}
+                          {% if d.tags %}
+                            <div style="margin-top: 6px;">
+                              {% for tag in d.tags %}
+                                {% if tag == '페이지' %}
+                                  <span class="pill page" style="margin-right: 4px; font-size: 10px;">{{ tag }}</span>
+                                {% elif tag == '데이터베이스' %}
+                                  <span class="pill database" style="margin-right: 4px; font-size: 10px;">{{ tag }}</span>
+                                {% elif tag == '이미지' %}
+                                  <span class="pill images" style="margin-right: 4px; font-size: 10px;">{{ tag }}</span>
+                                {% elif tag == '첨부파일' %}
+                                  <span class="pill attachments" style="margin-right: 4px; font-size: 10px;">{{ tag }}</span>
+                                {% else %}
+                                  <span class="pill" style="margin-right: 4px; font-size: 10px;">{{ tag }}</span>
+                                {% endif %}
+                              {% endfor %}
+                            </div>
+                          {% endif %}
+                        </div>
+                        <!-- Professional Quality Indicator -->
+                        {% set quality_score = ((d.size or 0) > 0) + ((d.pages or 0) > 0) + ((d.file_count or 0) > 0) + (d.description|length > 0 if d.description else 0) %}
+                        {% if quality_score >= 4 %}
+                          <div class="quality-high" title="고품질 덤프 - 완전한 메타데이터"></div>
+                        {% elif quality_score >= 3 %}
+                          <div class="quality-medium" title="양호한 덤프 - 대부분의 메타데이터"></div>
+                        {% else %}
+                          <div class="quality-low" title="기본 덤프 - 제한된 메타데이터"></div>
+                        {% endif %}
+                      </div>
+                    </td>
+                    <td>
+                      <div style="font-size: 12px;">
+                        {{ d.get('type', 'unknown') }}
+                      </div>
+                    </td>
+                    <td>
+                      <div style="font-size: 12px;">
+                        {% if d.size > 0 %}
+                          {{ (d.size / 1024 / 1024)|round(1) }} MB
+                        {% else %}
+                          -
+                        {% endif %}
+                      </div>
+                    </td>
+                    <td>
+                      <div style="font-size: 12px;">
+                        {% if d.pages > 0 %}📄 {{ d.pages }}페이지{% endif %}
+                        {% if d.file_count > 0 %}
+                          {% if d.pages > 0 %}<br>{% endif %}
+                          📁 {{ d.file_count }}파일
+                        {% endif %}
+                        {% if d.images > 0 %}
+                          <br>🖼️ {{ d.images }}이미지
+                        {% endif %}
+                        {% if d.attachments > 0 %}
+                          <br>📎 {{ d.attachments }}첨부
+                        {% endif %}
+                      </div>
+                    </td>
+                    <td>
+                      <div style="font-size: 11px;">
+                        {% if d.timestamp %}
+                          {{ d.timestamp.strftime('%m-%d %H:%M') }}
+                        {% else %}
+                          -
+                        {% endif %}
+                      </div>
+                    </td>
+                    <td><span class="pill ok">완료</span></td>
+                    <td style="min-width: 120px;">
+                      <div class="actions">
+                        <button class="btn" onclick="selectDumpForMigration('{{ d.name }}')" 
+                                title="이 덤프를 마이그레이션용으로 선택"
+                                style="font-size: 11px; padding: 4px 8px; background: #4f46e5; color: white; border-radius: 4px; transition: all 0.2s;"
+                                onmouseover="this.style.background='#3730a3'"
+                                onmouseout="this.style.background='#4f46e5'">선택</button>
+                        <button class="btn" onclick="deleteDump('{{ d.name }}')" 
+                                title="이 덤프를 영구적으로 삭제 (복구 불가)"
+                                style="font-size: 11px; padding: 4px 8px; background: #f8f9fa; color: #6c757d; border: 1px solid #dee2e6; border-radius: 4px; transition: all 0.2s;"
+                                onmouseover="this.style.background='#e9ecef'; this.style.color='#495057'"
+                                onmouseout="this.style.background='#f8f9fa'; this.style.color='#6c757d'">삭제</button>
+                      </div>
+                      <div style="margin-top: 6px;">
+                        <a href="/api/browse/{{ d.name }}/" target="_blank" 
+                           title="덤프 파일 구조와 내용 확인"
+                           style="font-size: 10px; color: #6c757d; text-decoration: none; padding: 2px 4px; border-radius: 3px; transition: all 0.2s;"
+                           onmouseover="this.style.background='#f8f9fa'; this.style.color='#495057'"
+                           onmouseout="this.style.background='transparent'; this.style.color='#6c757d'">📁 파일 보기</a>
+                      </div>
+                    </td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endfor %}
+      {% else %}
+        <!-- Fallback for when no groups exist -->
+        <table style="width: 100%; border-collapse: collapse;">
+          <thead>
+            <tr>
+              <th>덤프 이름</th>
+              <th>상태</th>
+              <th>링크</th>
+              <th>작업</th>
+            </tr>
+          </thead>
+          <tbody id="dumpTbody">
             <tr>
               <td colspan="4" style="text-align: center; color: #666; padding: 32px;">
                 덤프가 없습니다. 위에서 새 덤프를 생성해보세요.
               </td>
             </tr>
-          {% endif %}
-        </tbody>
-      </table>
+          </tbody>
+        </table>
+      {% endif %}
     </div>
   </div>
 
@@ -103,6 +420,72 @@
       <h4>마이그레이션</h4>
       <div id="migList"></div>
     </div>
+    
+    <!-- Job History Section -->
+    <h3>작업 진행 히스토리</h3>
+    
+    <!-- Statistics Dashboard -->
+    <div class="card">
+      <h4>통계</h4>
+      <div id="statsContent">
+        <p class="muted" style="text-align: center; padding: 16px;">통계를 불러오는 중...</p>
+      </div>
+    </div>
+    
+    <!-- History Controls -->
+    <div class="card">
+      <h4>히스토리 필터</h4>
+      <div style="margin-bottom: 12px;">
+        <label style="display: inline-block; width: 80px; font-size: 14px;">기간:</label>
+        <select id="historyPeriod" style="margin-right: 8px;">
+          <option value="7">최근 7일</option>
+          <option value="30">최근 30일</option>
+          <option value="90">최근 90일</option>
+          <option value="custom">사용자 정의</option>
+        </select>
+        <div id="customDateRange" style="display: none; margin-top: 8px;">
+          <input type="date" id="startDate" style="margin-right: 4px;">
+          <span>~</span>
+          <input type="date" id="endDate" style="margin-left: 4px;">
+        </div>
+      </div>
+      <div style="margin-bottom: 12px;">
+        <label style="display: inline-block; width: 80px; font-size: 14px;">작업 유형:</label>
+        <select id="jobTypeFilter">
+          <option value="">전체</option>
+          <option value="dump">페이지 덤프</option>
+          <option value="dump_database">데이터베이스 덤프</option>
+          <option value="migrate">마이그레이션</option>
+        </select>
+      </div>
+      <div style="margin-bottom: 12px;">
+        <label style="display: inline-block; width: 80px; font-size: 14px;">상태:</label>
+        <select id="statusFilter">
+          <option value="">전체</option>
+          <option value="done">완료</option>
+          <option value="failed">실패</option>
+          <option value="canceled">취소됨</option>
+          <option value="error">오류</option>
+        </select>
+      </div>
+      <div>
+        <button id="applyFiltersBtn" class="btn">필터 적용</button>
+        <button id="refreshHistoryBtn" class="btn">새로고침</button>
+      </div>
+    </div>
+    
+    <!-- History Display -->
+    <div class="card">
+      <div class="row">
+        <h4 style="margin:0">히스토리</h4>
+        <div>
+          <button id="exportHistoryBtn" class="btn">내보내기</button>
+        </div>
+      </div>
+      <div id="historyContent">
+        <p class="muted" style="text-align: center; padding: 16px;">히스토리를 불러오는 중...</p>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -113,11 +496,28 @@ async function postJSON(url, body) {
   return r.json();
 }
 
+// Handle dump type selection placeholder update
+document.getElementById('dumpType').addEventListener('change', function() {
+  const notionIdInput = document.getElementById('notionIdInput');
+  if (this.value === 'page') {
+    notionIdInput.placeholder = '노션 페이지 ID 또는 URL';
+  } else if (this.value === 'database') {
+    notionIdInput.placeholder = '노션 데이터베이스 ID 또는 URL';
+  }
+});
+
 document.getElementById('dumpForm').addEventListener('submit', async (e)=>{
   e.preventDefault();
   const fd = new FormData(e.target);
-  const page_id = fd.get('page_id');
-  await postJSON('/jobs/dump', {page_id});
+  const dump_type = fd.get('dump_type');
+  const notion_id = fd.get('notion_id');
+  
+  if (dump_type === 'page') {
+    await postJSON('/jobs/dump', {page_id: notion_id});
+  } else if (dump_type === 'database') {
+    await postJSON('/jobs/dump_database', {database_id: notion_id});
+  }
+  
   e.target.reset();
 });
 
@@ -160,45 +560,52 @@ async function deleteDump(dumpName) {
 }
 
 /* ────────────────────────────────
+   탭 전환 기능
+   ──────────────────────────────── */
+function showTab(groupKey) {
+  // Hide all tab contents
+  const tabContents = document.querySelectorAll('.tab-content');
+  tabContents.forEach(content => content.classList.remove('active'));
+  
+  // Remove active class from all tab buttons
+  const tabButtons = document.querySelectorAll('.tab-btn');
+  tabButtons.forEach(btn => btn.classList.remove('active'));
+  
+  // Show selected tab content
+  const selectedTab = document.getElementById('tab-' + groupKey);
+  if (selectedTab) {
+    selectedTab.classList.add('active');
+  }
+  
+  // Add active class to clicked button
+  const clickedButton = Array.from(tabButtons).find(btn => 
+    btn.textContent.includes(groupKey)
+  );
+  if (clickedButton) {
+    clickedButton.classList.add('active');
+  }
+}
+
+/* ────────────────────────────────
    덤프 목록 렌더링
    ──────────────────────────────── */
-const tbody = document.getElementById('dumpTbody');
 const dumpSelect = document.getElementById('dumpSelect');
 const refreshBtn = document.getElementById('refreshDumpsBtn');
 
-function rowHTML(it){
-  const status = it.ready ? '<span class="pill ok">완료</span>' : '<span class="pill wait">진행 중</span>';
-  return `
-    <tr>
-      <td>${it.name}</td>
-      <td>${status}</td>
-      <td><a href="${it.static_url}" target="_blank">${it.static_url}</a></td>
-      <td><button class="btn" onclick="deleteDump('${it.name}')">삭제</button></td>
-    </tr>
-  `;
-}
-
-function renderDumps(items){
-  tbody.innerHTML = items.map(rowHTML).join('');
-  const current = dumpSelect.value;
-  dumpSelect.innerHTML = `<option value="" disabled ${current ? "" : "selected"}>덤프 선택</option>` +
-    items.map(it => `<option value="${it.name}">${it.name}</option>`).join('');
-  if (items.some(x => x.name === current)) dumpSelect.value = current;
-}
-
-async function fetchDumpsOnce(){
-  const r = await fetch('/api/dumps?detail=1');
-  if (!r.ok) throw new Error(await r.text());
-  const data = await r.json();
-  renderDumps(data.entries || []);
-}
+// Old table rendering functions removed - now using server-side rendering with page reload
 
 async function refreshDumps(){
   refreshBtn.disabled = true;
   refreshBtn.textContent = '갱신 중...';
-  try { await fetchDumpsOnce(); }
-  catch(e){ console.error(e); alert('덤프 목록을 불러오지 못했습니다.'); }
-  finally { refreshBtn.disabled = false; refreshBtn.textContent = '새로고침'; }
+  try { 
+    // Reload the page to get the latest server-rendered dump list
+    window.location.reload();
+  }
+  catch(e){ 
+    console.error(e); 
+    refreshBtn.disabled = false; 
+    refreshBtn.textContent = '새로고침'; 
+  }
 }
 refreshBtn.addEventListener('click', refreshDumps);
 
@@ -235,7 +642,7 @@ function renderJob(j){
       <div class="progress"><div class="bar" data-bar></div></div>
     `;
     byId.set(id, el);
-    (j.type==='dump'?dumpJobList:migList).prepend(el);
+    (j.type==='dump'||j.type==='dump_database'?dumpJobList:migList).prepend(el);
   }
   el.querySelector('.status').textContent = j.status;
   el.querySelector('[data-msg]').textContent = j.message || '';
@@ -259,7 +666,7 @@ function renderJob(j){
   }
 
   // 덤프 완료 시 목록 즉시 갱신
-  if (j.type === 'dump' && (j.status === 'done' || j.status === 'canceled')) {
+  if ((j.type === 'dump' || j.type === 'dump_database') && (j.status === 'done' || j.status === 'canceled')) {
     fetchDumpsOnce().catch(console.error);
   }
 }
@@ -289,6 +696,524 @@ function applySnapshot(items){
   es.addEventListener('ping', ()=>{});
   es.onerror = () => { es.close(); setTimeout(connectDumpsSSE, 1500); };
 })();
+
+/* ────────────────────────────────
+   작업 히스토리 관리
+   ──────────────────────────────── */
+const historyContent = document.getElementById('historyContent');
+const refreshHistoryBtn = document.getElementById('refreshHistoryBtn');
+const statsContent = document.getElementById('statsContent');
+const historyPeriod = document.getElementById('historyPeriod');
+const customDateRange = document.getElementById('customDateRange');
+const startDate = document.getElementById('startDate');
+const endDate = document.getElementById('endDate');
+const jobTypeFilter = document.getElementById('jobTypeFilter');
+const statusFilter = document.getElementById('statusFilter');
+const applyFiltersBtn = document.getElementById('applyFiltersBtn');
+const exportHistoryBtn = document.getElementById('exportHistoryBtn');
+
+function formatDateTime(isoString) {
+  if (!isoString) return '';
+  const date = new Date(isoString);
+  return date.toLocaleString('ko-KR', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+}
+
+function getStatusBadge(status) {
+  const badges = {
+    'queued': '<span class="pill" style="background:#f0f0f0; color:#666;">대기중</span>',
+    'running': '<span class="pill" style="background:#fff3cd; color:#856404;">실행중</span>',
+    'done': '<span class="pill ok">완료</span>',
+    'failed': '<span class="pill" style="background:#f8d7da; color:#721c24;">실패</span>',
+    'canceled': '<span class="pill" style="background:#e2e3e5; color:#383d41;">취소됨</span>',
+    'error': '<span class="pill" style="background:#f8d7da; color:#721c24;">오류</span>'
+  };
+  return badges[status] || `<span class="pill">${status}</span>`;
+}
+
+function getJobTypeText(jobType) {
+  const types = {
+    'dump': '페이지 덤프',
+    'dump_database': '데이터베이스 덤프',
+    'migrate': '마이그레이션'
+  };
+  return types[jobType] || jobType;
+}
+
+function renderJobHistory(historyData) {
+  if (!historyData || Object.keys(historyData).length === 0) {
+    historyContent.innerHTML = '<p class="muted" style="text-align: center; padding: 16px;">히스토리가 없습니다.</p>';
+    return;
+  }
+
+  let html = '';
+  const sortedDates = Object.keys(historyData).sort().reverse(); // Most recent first
+
+  sortedDates.forEach(date => {
+    const jobs = historyData[date];
+    if (!jobs || jobs.length === 0) return;
+
+    html += `
+      <div style="margin-bottom: 20px;">
+        <h5 style="margin: 8px 0; color: #666; border-bottom: 1px solid #eee; padding-bottom: 4px;">
+          ${new Date(date).toLocaleDateString('ko-KR', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric'
+          })}
+        </h5>
+        <div style="max-height: 200px; overflow-y: auto;">
+    `;
+
+    // Sort jobs by created_at (most recent first)
+    const sortedJobs = jobs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    sortedJobs.forEach(job => {
+      const duration = job.completed_at && job.started_at ? 
+        `${Math.round((new Date(job.completed_at) - new Date(job.started_at)) / 1000)}초` : '';
+      
+      html += `
+        <div style="border: 1px solid #eee; border-radius: 6px; padding: 8px; margin-bottom: 8px; font-size: 12px;">
+          <div class="row" style="margin-bottom: 4px;">
+            <div>
+              <strong>${getJobTypeText(job.job_type)}</strong>
+              ${getStatusBadge(job.status)}
+            </div>
+            <div class="muted">
+              ${job.progress || 0}%
+              ${duration ? `(${duration})` : ''}
+            </div>
+          </div>
+          <div class="muted" style="margin-bottom: 4px;">
+            시작: ${formatDateTime(job.created_at)}
+            ${job.completed_at ? `→ 완료: ${formatDateTime(job.completed_at)}` : ''}
+          </div>
+          ${job.message ? `<div class="muted" style="font-size: 11px;">${job.message}</div>` : ''}
+          ${job.error ? `<div style="color: #721c24; font-size: 11px;">오류: ${job.error}</div>` : ''}
+        </div>
+      `;
+    });
+
+    html += `
+        </div>
+      </div>
+    `;
+  });
+
+  historyContent.innerHTML = html;
+}
+
+// Statistics rendering
+function renderStatistics(stats) {
+  if (!stats) {
+    statsContent.innerHTML = '<p class="muted" style="text-align: center; padding: 16px;">통계 데이터가 없습니다.</p>';
+    return;
+  }
+
+  const html = `
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px;">
+      <div style="text-align: center; padding: 8px; background: #f8f9fa; border-radius: 6px;">
+        <div style="font-size: 20px; font-weight: bold; color: #495057;">${stats.total_jobs}</div>
+        <div style="font-size: 12px; color: #6c757d;">총 작업</div>
+      </div>
+      <div style="text-align: center; padding: 8px; background: #f8f9fa; border-radius: 6px;">
+        <div style="font-size: 20px; font-weight: bold; color: #28a745;">${stats.success_rate}%</div>
+        <div style="font-size: 12px; color: #6c757d;">성공률</div>
+      </div>
+    </div>
+    <div style="margin-bottom: 12px;">
+      <div style="font-size: 13px; margin-bottom: 4px; color: #495057;">작업 유형별</div>
+      <div style="font-size: 12px; color: #6c757d;">
+        덤프: ${stats.by_type.dump || 0} | 
+        DB덤프: ${stats.by_type.dump_database || 0} | 
+        마이그레이션: ${stats.by_type.migrate || 0}
+      </div>
+    </div>
+    <div>
+      <div style="font-size: 13px; margin-bottom: 4px; color: #495057;">상태별</div>
+      <div style="font-size: 12px; color: #6c757d;">
+        완료: ${stats.by_status.done || 0} | 
+        실패: ${stats.by_status.failed || 0} | 
+        취소: ${stats.by_status.canceled || 0}
+      </div>
+    </div>
+    ${stats.average_duration > 0 ? `
+      <div style="margin-top: 12px; font-size: 12px; color: #6c757d;">
+        평균 소요시간: ${Math.round(stats.average_duration)}초
+      </div>
+    ` : ''}
+  `;
+  
+  statsContent.innerHTML = html;
+}
+
+async function fetchStatistics(days = 30) {
+  try {
+    const response = await fetch(`/jobs/statistics?days=${days}`);
+    if (!response.ok) throw new Error('Failed to fetch statistics');
+    
+    const data = await response.json();
+    renderStatistics(data.statistics);
+  } catch (error) {
+    console.error('Error fetching statistics:', error);
+    statsContent.innerHTML = '<p class="muted" style="text-align: center; padding: 16px; color: #721c24;">통계를 불러오는데 실패했습니다.</p>';
+  }
+}
+
+// Date range handling
+historyPeriod.addEventListener('change', function() {
+  if (this.value === 'custom') {
+    customDateRange.style.display = 'block';
+    // Set default dates
+    const today = new Date();
+    const weekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+    endDate.valueAsDate = today;
+    startDate.valueAsDate = weekAgo;
+  } else {
+    customDateRange.style.display = 'none';
+  }
+});
+
+// Enhanced history fetching with filters
+async function fetchJobHistory() {
+  try {
+    refreshHistoryBtn.disabled = true;
+    refreshHistoryBtn.textContent = '불러오는 중...';
+    
+    let url = '/jobs/history';
+    const period = historyPeriod.value;
+    const jobType = jobTypeFilter.value;
+    const status = statusFilter.value;
+    
+    if (period === 'custom') {
+      if (!startDate.value || !endDate.value) {
+        alert('사용자 정의 기간을 선택할 때는 시작일과 종료일을 모두 입력해야 합니다.');
+        return;
+      }
+      url = `/jobs/history/range?start_date=${startDate.value}&end_date=${endDate.value}`;
+      if (jobType) url += `&job_type=${jobType}`;
+      if (status) url += `&status=${status}`;
+    } else {
+      url += `?days=${period}`;
+    }
+    
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Failed to fetch history');
+    
+    const data = await response.json();
+    const historyData = period === 'custom' ? data.history : data.history;
+    
+    // Apply client-side filtering for non-custom periods
+    let filteredHistory = historyData;
+    if (period !== 'custom' && (jobType || status)) {
+      filteredHistory = {};
+      Object.keys(historyData).forEach(date => {
+        const jobs = historyData[date];
+        const filteredJobs = jobs.filter(job => {
+          if (jobType && job.job_type !== jobType) return false;
+          if (status && job.status !== status) return false;
+          return true;
+        });
+        if (filteredJobs.length > 0) {
+          filteredHistory[date] = filteredJobs;
+        }
+      });
+    }
+    
+    renderJobHistory(filteredHistory);
+  } catch (error) {
+    console.error('Error fetching job history:', error);
+    historyContent.innerHTML = '<p class="muted" style="text-align: center; padding: 16px; color: #721c24;">히스토리를 불러오는데 실패했습니다.</p>';
+  } finally {
+    refreshHistoryBtn.disabled = false;
+    refreshHistoryBtn.textContent = '새로고침';
+  }
+}
+
+// Export functionality
+async function exportHistory() {
+  try {
+    exportHistoryBtn.disabled = true;
+    exportHistoryBtn.textContent = '내보내는 중...';
+    
+    const period = historyPeriod.value;
+    let url = '/jobs/history';
+    
+    if (period === 'custom') {
+      if (!startDate.value || !endDate.value) {
+        alert('사용자 정의 기간을 선택할 때는 시작일과 종료일을 모두 입력해야 합니다.');
+        return;
+      }
+      url = `/jobs/history/range?start_date=${startDate.value}&end_date=${endDate.value}`;
+    } else {
+      url += `?days=${period}`;
+    }
+    
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Failed to fetch history for export');
+    
+    const data = await response.json();
+    const historyData = period === 'custom' ? data.history : data.history;
+    
+    // Convert to CSV
+    const csvData = [];
+    csvData.push(['날짜', '작업ID', '작업유형', '상태', '진행률', '시작시간', '완료시간', '메시지']);
+    
+    Object.keys(historyData).sort().forEach(date => {
+      historyData[date].forEach(job => {
+        csvData.push([
+          date,
+          job.job_id,
+          getJobTypeText(job.job_type),
+          job.status,
+          job.progress + '%',
+          formatDateTime(job.created_at),
+          job.completed_at ? formatDateTime(job.completed_at) : '',
+          job.message || ''
+        ]);
+      });
+    });
+    
+    // Create and download CSV
+    const csvContent = csvData.map(row => row.map(cell => `"${cell}"`).join(',')).join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    const filename = `job_history_${new Date().toISOString().split('T')[0]}.csv`;
+    
+    if (link.download !== undefined) {
+      const url = URL.createObjectURL(blob);
+      link.setAttribute('href', url);
+      link.setAttribute('download', filename);
+      link.style.visibility = 'hidden';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+  } catch (error) {
+    console.error('Error exporting history:', error);
+    alert('히스토리 내보내기에 실패했습니다.');
+  } finally {
+    exportHistoryBtn.disabled = false;
+    exportHistoryBtn.textContent = '내보내기';
+  }
+}
+
+// Event handlers
+applyFiltersBtn.addEventListener('click', fetchJobHistory);
+exportHistoryBtn.addEventListener('click', exportHistory);
+
+// Initialize features on page load
+fetchJobHistory();
+fetchStatistics();
+
+// Refresh history button
+refreshHistoryBtn.addEventListener('click', () => {
+  fetchJobHistory();
+  fetchStatistics();
+});
+
+// Enhanced Dump Selection Functions
+function applyFilters() {
+  const search = document.getElementById('searchInput').value;
+  const sort = document.getElementById('sortSelect').value;
+  const type = document.getElementById('typeSelect').value;
+  const size = document.getElementById('sizeSelect').value;
+  
+  let url = '/?';
+  const params = [];
+  
+  if (search) params.push(`search=${encodeURIComponent(search)}`);
+  if (sort && sort !== 'timestamp') params.push(`sort=${sort}`);
+  if (type) params.push(`type=${type}`);
+  
+  // Always reset to page 1 when applying filters
+  params.push('page=1');
+  
+  // Handle size filter
+  if (size) {
+    switch(size) {
+      case 'small':
+        params.push('max_size=1048576'); // 1MB
+        break;
+      case 'medium':
+        params.push('min_size=1048576');
+        params.push('max_size=10485760'); // 1MB-10MB
+        break;
+      case 'large':
+        params.push('min_size=10485760');
+        params.push('max_size=104857600'); // 10MB-100MB
+        break;
+      case 'xlarge':
+        params.push('min_size=104857600'); // 100MB+
+        break;
+    }
+  }
+  
+  if (params.length > 0) {
+    url += params.join('&');
+  }
+  
+  window.location.href = url;
+}
+
+function clearFilters() {
+  window.location.href = '/';
+}
+
+function updateDumpInfo() {
+  const select = document.getElementById('dumpSelect');
+  const info = document.getElementById('dumpInfo');
+  const content = document.getElementById('dumpInfoContent');
+  
+  if (select.value && select.selectedIndex > 0) {
+    const option = select.options[select.selectedIndex];
+    const size = option.dataset.size;
+    const pages = option.dataset.pages;
+    const files = option.dataset.files;
+    const type = option.dataset.type;
+    const timestamp = option.dataset.timestamp;
+    
+    let infoHtml = '<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">';
+    
+    if (type) {
+      infoHtml += `<div><strong>타입:</strong> ${type}</div>`;
+    }
+    if (timestamp) {
+      infoHtml += `<div><strong>생성:</strong> ${timestamp}</div>`;
+    }
+    if (size && size > 0) {
+      infoHtml += `<div><strong>크기:</strong> ${(size / 1024 / 1024).toFixed(1)} MB</div>`;
+    }
+    if (pages && pages > 0) {
+      infoHtml += `<div><strong>페이지:</strong> ${pages}개</div>`;
+    }
+    if (files && files > 0) {
+      infoHtml += `<div><strong>파일:</strong> ${files}개</div>`;
+    }
+    
+    infoHtml += '</div>';
+    
+    if (!type && !timestamp && !size && !pages && !files) {
+      infoHtml = '<div style="color: #666; font-style: italic;">메타데이터를 불러올 수 없습니다.</div>';
+    }
+    
+    content.innerHTML = infoHtml;
+    info.style.display = 'block';
+  } else {
+    info.style.display = 'none';
+  }
+}
+
+function selectDumpForMigration(dumpName) {
+  const select = document.getElementById('dumpSelect');
+  select.value = dumpName;
+  updateDumpInfo();
+  
+  // Highlight the selection
+  select.style.background = '#e3f2fd';
+  setTimeout(() => {
+    select.style.background = '';
+  }, 2000);
+  
+  // Scroll to migration form
+  document.querySelector('#migForm').scrollIntoView({ behavior: 'smooth' });
+  
+  // Show notification
+  showNotification(`"${dumpName}" 덤프가 선택되었습니다.`, 'success');
+}
+
+function showNotification(message, type = 'info') {
+  // Create notification element
+  const notification = document.createElement('div');
+  notification.style.cssText = `
+    position: fixed; top: 20px; right: 20px; z-index: 9999;
+    padding: 12px 16px; border-radius: 8px; color: white;
+    font-size: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    transform: translateX(100%); transition: transform 0.3s ease;
+  `;
+  
+  switch(type) {
+    case 'success':
+      notification.style.background = '#4caf50';
+      break;
+    case 'error':
+      notification.style.background = '#f44336';
+      break;
+    default:
+      notification.style.background = '#2196f3';
+  }
+  
+  notification.textContent = message;
+  document.body.appendChild(notification);
+  
+  // Animate in
+  setTimeout(() => {
+    notification.style.transform = 'translateX(0)';
+  }, 100);
+  
+  // Animate out and remove
+  setTimeout(() => {
+    notification.style.transform = 'translateX(100%)';
+    setTimeout(() => {
+      document.body.removeChild(notification);
+    }, 300);
+  }, 3000);
+}
+
+// Initialize enhanced dump selection
+document.addEventListener('DOMContentLoaded', function() {
+  // Set current filter values
+  const urlParams = new URLSearchParams(window.location.search);
+  
+  if (urlParams.get('search')) {
+    document.getElementById('searchInput').value = urlParams.get('search');
+  }
+  if (urlParams.get('sort')) {
+    document.getElementById('sortSelect').value = urlParams.get('sort');
+  }
+  if (urlParams.get('type')) {
+    document.getElementById('typeSelect').value = urlParams.get('type');
+  }
+  
+  // Handle size filter
+  const minSize = urlParams.get('min_size');
+  const maxSize = urlParams.get('max_size');
+  if (minSize && maxSize) {
+    if (minSize == '1048576' && maxSize == '10485760') {
+      document.getElementById('sizeSelect').value = 'medium';
+    } else if (minSize == '10485760' && maxSize == '104857600') {
+      document.getElementById('sizeSelect').value = 'large';
+    }
+  } else if (maxSize == '1048576') {
+    document.getElementById('sizeSelect').value = 'small';
+  } else if (minSize == '104857600') {
+    document.getElementById('sizeSelect').value = 'xlarge';
+  }
+  
+  // Enable Enter key for search
+  document.getElementById('searchInput').addEventListener('keypress', function(e) {
+    if (e.key === 'Enter') {
+      applyFilters();
+    }
+  });
+  
+  // Auto-apply filters on change
+  document.getElementById('sortSelect').addEventListener('change', applyFilters);
+  document.getElementById('typeSelect').addEventListener('change', applyFilters);
+  document.getElementById('sizeSelect').addEventListener('change', applyFilters);
+});
+
+// Auto-refresh history and stats every 30 seconds
+setInterval(() => {
+  fetchJobHistory();
+  fetchStatistics();
+}, 30000);
 </script>
 </body>
 </html>

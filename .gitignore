@@ -31,3 +31,6 @@ _logs/
 .env
 .env.local
 config.yaml
+
+# History
+_history/

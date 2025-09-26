@@ -98,11 +98,13 @@ def download_manifest(name: str, settings: Settings = Depends(require_settings))
 
 def _build_asset_map_from_manifest(manifest: Dict[str, Any], settings: Settings) -> Dict[str, List[Dict[str, str]]]:
     """
-    manifest.nodes[*].files[] -> Build upload map by node_id
+    manifest.nodes[*].files[] (for page dumps) or manifest.entries[*].files[] (for database dumps) -> Build upload map by node_id
     files item example:
       { "url": "...", "path": "<dump_root_relative>", "original": "IMG_0001.png", "saved": "abcd.png" }
     """
     amap: Dict[str, List[Dict[str, str]]] = {}
+    
+    # Handle page dumps (nodes array)
     for node in manifest.get("nodes", []):
         nid = node.get("id")
         files = node.get("files", [])
@@ -119,6 +121,44 @@ def _build_asset_map_from_manifest(manifest: Dict[str, Any], settings: Settings)
             })
         if lst:
             amap[nid] = lst
+    
+    # Handle database dumps (entries array)
+    for entry_node in manifest.get("entries", []):
+        entry_id = entry_node.get("id")
+        entry_files = entry_node.get("files", [])
+        
+        # Handle entry-level files (from new structure)
+        if entry_id and entry_files:
+            lst: List[Dict[str, str]] = []
+            for fobj in entry_files:
+                rel = fobj.get("path")  # "<dump_name>/<saved>"
+                local_path = os.path.join(settings.DUMP_ROOT, rel) if rel else None
+                lst.append({
+                    "local_path": local_path,
+                    "rel_path": rel or "",
+                    "original": fobj.get("original") or fobj.get("saved") or "file",
+                })
+            if lst:
+                amap[entry_id] = lst
+        
+        # Handle block-level files within the entry (for individual block assets)
+        for node in entry_node.get("nodes", []):
+            nid = node.get("id")
+            files = node.get("files", [])
+            if not nid or not files:
+                continue
+            lst: List[Dict[str, str]] = []
+            for fobj in files:
+                rel = fobj.get("path")  # "<dump_name>/<saved>"
+                local_path = os.path.join(settings.DUMP_ROOT, rel) if rel else None
+                lst.append({
+                    "local_path": local_path,
+                    "rel_path": rel or "",
+                    "original": fobj.get("original") or fobj.get("saved") or "file",
+                })
+            if lst:
+                amap[nid] = lst
+            
     return amap
 
 @router.post("/migrate")
@@ -150,8 +190,16 @@ async def migrate_now(
     asset_map = _build_asset_map_from_manifest(manifest, settings)
 
     msvc = NotionMigrateService(settings)
-    await msvc.migrate_under(target_page_id, tree, asset_map)
-    return {"ok": True}
+    
+    # Check if this is a database dump or a page dump
+    if tree.get("type") == "database":
+        # Use database migration method for database dumps
+        new_db_id = await msvc.migrate_database_under(target_page_id, tree, asset_map)
+        return {"ok": True, "new_database_id": new_db_id}
+    else:
+        # Use page migration method for page dumps
+        await msvc.migrate_under(target_page_id, tree, asset_map)
+        return {"ok": True}
 
 @router.get("/browse/{name}/", response_class=HTMLResponse)
 def browse_dump(name: str, settings: Settings = Depends(require_settings)):

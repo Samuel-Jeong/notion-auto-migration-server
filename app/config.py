@@ -23,6 +23,13 @@ class Settings(BaseModel):
 
     # Legacy (backward compatibility): single string
     AUTO_DUMP_PAGE_ID: str = Field(default="", description="DEPRECATED: use AUTO_DUMP_PAGE_IDS")
+    
+    # --- Auto dump database ID management ---
+    # New (recommended): list format
+    AUTO_DUMP_DATABASE_IDS: List[str] = Field(default_factory=list)
+
+    # Legacy (backward compatibility): single string
+    AUTO_DUMP_DATABASE_ID: str = Field(default="", description="DEPRECATED: use AUTO_DUMP_DATABASE_IDS")
 
     # Notion API options
     NOTION_TIMEOUT: int = Field(default=15)
@@ -32,6 +39,10 @@ class Settings(BaseModel):
     @property
     def AUTO_DUMP_PAGE_IDS_EFFECTIVE(self) -> List[str]:
         return self.auto_dump_ids()
+
+    @property
+    def AUTO_DUMP_DATABASE_IDS_EFFECTIVE(self) -> List[str]:
+        return self.auto_dump_database_ids()
 
     def auto_dump_ids(self) -> List[str]:
         """
@@ -60,6 +71,37 @@ class Settings(BaseModel):
 
         # 2) Merge legacy single value
         for token in _split_maybe_list_string(self.AUTO_DUMP_PAGE_ID):
+            push(token)
+
+        return merged
+
+    def auto_dump_database_ids(self) -> List[str]:
+        """
+        Merge AUTO_DUMP_DATABASE_IDS (list) and AUTO_DUMP_DATABASE_ID (single) with
+        space/comma separation support, removing empty values, duplicates while preserving order.
+        """
+        merged: List[str] = []
+
+        def push(v: Optional[str]):
+            if not v:
+                return
+            s = v.strip()
+            if not s:
+                return
+            if s not in merged:
+                merged.append(s)
+
+        # 1) List first
+        for item in self.AUTO_DUMP_DATABASE_IDS or []:
+            # Allow splitting if item is comma-separated string like "a,b"
+            if isinstance(item, str) and ("," in item or " " in item):
+                for token in _split_maybe_list_string(item):
+                    push(token)
+            else:
+                push(str(item))
+
+        # 2) Merge legacy single value
+        for token in _split_maybe_list_string(self.AUTO_DUMP_DATABASE_ID):
             push(token)
 
         return merged
@@ -144,9 +186,13 @@ def get_settings(config_path: Optional[str] = None) -> Settings:
     y_static = y.get("STATIC_BASE_URL")
     y_cron = y.get("CRON")
 
-    # 신규 리스트 키/구버전 단일 키
+    # 신규 리스트 키/구버전 단일 키 (페이지)
     y_ids_list = _coerce_auto_dump_ids(y.get("AUTO_DUMP_PAGE_IDS"))
     y_id_single = y.get("AUTO_DUMP_PAGE_ID")
+    
+    # 신규 리스트 키/구버전 단일 키 (데이터베이스)
+    y_db_ids_list = _coerce_auto_dump_ids(y.get("AUTO_DUMP_DATABASE_IDS"))
+    y_db_id_single = y.get("AUTO_DUMP_DATABASE_ID")
 
     y_timeout = y.get("NOTION_TIMEOUT")
     y_retries = y.get("NOTION_MAX_RETRIES")
@@ -158,9 +204,13 @@ def get_settings(config_path: Optional[str] = None) -> Settings:
     static_base = env.get("STATIC_BASE_URL", y_static or "http://127.0.0.1:8000/files")
     cron = env.get("CRON", y_cron or "0 * * * *")
 
-    # 리스트/단일 혼합 수용
+    # 리스트/단일 혼합 수용 (페이지)
     env_ids_list = _coerce_auto_dump_ids(env.get("AUTO_DUMP_PAGE_IDS"))
     env_id_single = env.get("AUTO_DUMP_PAGE_ID", y_id_single or "")
+    
+    # 리스트/단일 혼합 수용 (데이터베이스)
+    env_db_ids_list = _coerce_auto_dump_ids(env.get("AUTO_DUMP_DATABASE_IDS"))
+    env_db_id_single = env.get("AUTO_DUMP_DATABASE_ID", y_db_id_single or "")
 
     # 최종 리스트는 리스트(ENV→YAML) + 단일(ENV→YAML) 병합
     # (Settings 내부에서 다시 병합하지만, 기본값 채움 차원에서 먼저 생성)
@@ -182,6 +232,25 @@ def get_settings(config_path: Optional[str] = None) -> Settings:
     for v in _split_maybe_list_string(env_id_single):
         add_one(v)
 
+    # 데이터베이스 ID 병합
+    final_db_ids_list: List[str] = []
+    db_seen = set()
+
+    def add_db_one(v: Optional[str]):
+        if not v:
+            return
+        s = v.strip()
+        if not s or s in db_seen:
+            return
+        db_seen.add(s)
+        final_db_ids_list.append(s)
+
+    for v in env_db_ids_list or y_db_ids_list:
+        add_db_one(v)
+
+    for v in _split_maybe_list_string(env_db_id_single):
+        add_db_one(v)
+
     # 숫자 파싱(환경변수 우선)
     try:
         timeout = int(env.get("NOTION_TIMEOUT", y_timeout if y_timeout is not None else 15))
@@ -199,6 +268,8 @@ def get_settings(config_path: Optional[str] = None) -> Settings:
         CRON=cron,
         AUTO_DUMP_PAGE_IDS=final_ids_list,
         AUTO_DUMP_PAGE_ID=env_id_single or (y_id_single or ""),
+        AUTO_DUMP_DATABASE_IDS=final_db_ids_list,
+        AUTO_DUMP_DATABASE_ID=env_db_id_single or (y_db_id_single or ""),
         NOTION_TIMEOUT=timeout,
         NOTION_MAX_RETRIES=retries,
     )
