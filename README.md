@@ -66,6 +66,136 @@
 
 ---
 
+## 전체 아키텍처 다이어그램 (FastAPI + Dump + Migration + Job/SSE + Static)
+```mermaid
+flowchart LR
+  subgraph Client["Client"]
+    WEB["Web UI<br/>http://127.0.0.1:8000/"]
+    API["REST API Client<br/>curl / Postman 등"]
+    SSE["SSE Subscriber<br/>실시간 모니터링"]
+  end
+
+  subgraph Server["notion-auto-migration-server (FastAPI)"]
+    APP["FastAPI App<br/>- /docs (Swagger)<br/>- /health"]
+    DUMPAPI["Dump API<br/>POST /api/dump<br/>GET /api/dumps<br/>DELETE /api/dump/{name}"]
+    MIGAPI["Migration API<br/>POST /api/migrate"]
+    JOBAPI["Job API<br/>GET /jobs<br/>POST /jobs/dump<br/>POST /jobs/migrate<br/>POST /jobs/{id}/cancel<br/>POST /jobs/{id}/remove"]
+    STREAM["SSE Streams<br/>GET /jobs/stream<br/>GET /api/dumps/stream"]
+    STATIC["Static File Server<br/>/files/...<br/>+ File Browser<br/>/api/browse/{dump_name}/"]
+    SCHED["Cron Scheduler (Asia/Seoul)<br/>- CRON 기반 자동 Dump<br/>- 스케줄러 큐로 안전한 비동기 처리"]
+    JM["JobManager<br/>- 동시 작업 제한<br/>Dump 최대 3 / Migrate 최대 3<br/>- 상태: 대기/진행/완료/실패/취소"]
+    CORE["Core Workers<br/>Dump Engine / Migration Engine"]
+  end
+
+  subgraph Notion["Notion API"]
+    NAPI["Notion API<br/>페이지/블록 조회/생성"]
+  end
+
+  subgraph Storage["Local Storage (volume)"]
+    DUMPS["_dumps/<dump_name>/<br/>tree.json<br/>manifest.json<br/>attachments(files)"]
+    LOGS["_logs/<br/>app.log / uvicorn.log / access.log"]
+  end
+
+  WEB --> APP
+  API --> APP
+  SSE --> STREAM
+
+  APP --> DUMPAPI
+  APP --> MIGAPI
+  APP --> JOBAPI
+  APP --> STATIC
+  APP --> SCHED
+
+  DUMPAPI --> JM
+  MIGAPI --> JM
+  JOBAPI --> JM
+  STREAM --> JM
+
+  JM --> CORE
+  CORE --> NAPI
+
+  CORE --> DUMPS
+  APP --> LOGS
+  STATIC --> DUMPS
+```
+
+## Dump(백업) 실행 시퀀스 다이어그램
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as User
+  participant UI as Web UI / API Client
+  participant API as FastAPI (/api/dump)
+  participant JM as JobManager
+  participant DE as Dump Engine
+  participant N as Notion API
+  participant FS as Local _dumps
+
+  U->>UI: 덤프 실행 요청
+  UI->>API: POST /api/dump<br/>페이지 ID 등 파라미터
+  API->>JM: Dump Job 생성(큐잉)<br/>동시 실행 제한 적용
+  JM->>DE: Dump 작업 시작
+  DE->>N: 페이지/하위 블록 재귀 조회
+  N-->>DE: 블록/콘텐츠 응답
+  DE->>FS: tree.json 저장<br/>블록 구조 기록
+  DE->>N: 첨부 파일 URL 조회
+  N-->>DE: 파일 다운로드 링크
+  DE->>FS: 첨부 파일 다운로드 저장
+  DE->>FS: manifest.json 저장<br/>블록-파일 매핑 기록
+  DE-->>JM: Job 상태 완료로 갱신
+  JM-->>API: 결과/상태 업데이트
+```
+
+## Migration(복원) 실행 시퀀스 다이어그램
+```mermaid
+sequenceDiagram
+  autonumber
+  participant U as User
+  participant UI as Web UI / API Client
+  participant API as FastAPI (/api/migrate)
+  participant JM as JobManager
+  participant ME as Migration Engine
+  participant FS as Local _dumps
+  participant N as Notion API
+  participant ST as Static Server (/files/...)
+
+  U->>UI: 마이그레이션 요청<br/>(dump_name + target_page)
+  UI->>API: POST /api/migrate
+  API->>JM: Migrate Job 생성(큐잉)<br/>동시 실행 제한 적용
+  JM->>ME: Migration 작업 시작
+  ME->>FS: tree.json 로드
+  ME->>FS: manifest.json 로드
+  ME->>ME: 첨부파일 URL 치환<br/>로컬 파일 → /files/... URL
+  ME->>N: target_page 아래에 블록 append
+  N-->>ME: append 응답(생성된 block_id)
+  ME->>ME: block_id 추적하며 재귀 생성 반복
+  ME->>ST: /files/... 경로로 첨부 접근 가능
+  ME-->>JM: Job 상태 완료로 갱신
+```
+
+## Job 관리 + 실시간 모니터링(SSE) 구조
+```mermaid
+flowchart TB
+  subgraph API["REST API"]
+    J1["POST /jobs/dump<br/>POST /jobs/migrate"]
+    J2["POST /jobs/{job_id}/cancel<br/>POST /jobs/{job_id}/remove"]
+    J3["GET /jobs"]
+  end
+
+  subgraph SSE["SSE"]
+    S1["GET /jobs/stream<br/>실시간 Job 상태 스트림"]
+    S2["GET /api/dumps/stream<br/>실시간 Dump 목록 스트림"]
+  end
+
+  JM["JobManager<br/>- 동시성 제한<br/>- 상태 추적<br/>- 취소/삭제"] --> STS["Job State Store<br/>대기/진행/완료/실패/취소"]
+  API --> JM
+  S1 --> STS
+  S2 --> STS
+
+```
+
+---
+
 ## 🚀 빠른 시작
 
 ### Docker로 실행 (권장)
